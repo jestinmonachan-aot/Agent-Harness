@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+harness_data.db
+harness_data.db.bak
+*.bak
+
+worker_logs/
+migrated-app-*/
+migration_output_*/
+
+streamlit_log.txt

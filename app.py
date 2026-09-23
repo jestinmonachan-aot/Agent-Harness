@@ -6,17 +6,21 @@ Streamlit UI for the agent harness workflow:
   4. We parse + display the result, and save it as a .md report
   5. Optionally migrate to a new stack -> push to new repo
   6. Optionally dockerize + deploy -> show URL
+
+Each step runs in a fully detached worker process (see harness/worker.py +
+harness/job_runner.py) so a Streamlit crash/OOM/sleep cannot kill an
+in-flight Claude CLI call. This script never blocks on the CLI itself —
+it launches a step, then polls SQLite via st.rerun() until that step's
+status flips to 'done' or 'error'.
 """
 
-import streamlit as st
+import time
 from pathlib import Path
 
-from harness import db
-from harness.migrate import migrate_and_push
-from harness.deploy import dockerize_and_run
-from harness.repo_utils import clone_repo
-from harness.claude_cli import run_claude_prompt, check_claude_available
-from harness.md_utils import save_analysis_report
+import streamlit as st
+
+from harness import db, job_runner
+from harness.claude_cli import check_claude_available
 
 st.set_page_config(page_title="Agent Harness — Vulnerability Scan", layout="wide")
 db.init_db()
@@ -32,8 +36,7 @@ with st.sidebar:
     else:
         st.error(f"Claude CLI not available: {check.stderr}")
 
-# Persist state across reruns (every button click reruns the whole script)
-for key in ["repo_path", "result", "job_id", "repo_url"]:
+for key in ["job_id", "repo_url"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -45,90 +48,110 @@ repo_url = st.text_input(
 run_clicked = st.button("Run analysis", type="primary", disabled=not repo_url)
 
 if run_clicked:
-    with st.status("Cloning repo...", expanded=True) as status:
-        try:
-            repo_path = clone_repo(repo_url)
-            st.write(f"Cloned to `{repo_path}`")
-        except Exception as e:
-            status.update(label="Clone failed", state="error")
-            st.error(str(e))
-            st.stop()
-
-        status.update(label="Analyzing with Claude Code...")
-        prompt = (
-            f"You are analyzing the codebase at {repo_path} for a legacy "
-            "modernization migration. Identify security vulnerabilities: "
-            "outdated dependencies, injection risks, hardcoded secrets, "
-            "insecure auth, and anything blocking a safe migration. "
-            "Return a concise, structured list of findings."
-        )
-        result = run_claude_prompt(prompt, cwd=str(repo_path), timeout=1200)
-
-        if not result.success:
-            status.update(label="Analysis failed", state="error")
-            st.error(result.stderr or "Unknown error running Claude CLI.")
-            st.stop()
-
-        status.update(label="Done", state="complete")
-
-    report_path = Path("reports") / "latest_analysis.md"
-    save_analysis_report(report_path, repo_url, result.stdout)
-
-    job_id = db.create_job(repo_url)
-    db.save_findings(job_id, result.stdout)
-
-    # Save to session_state so Migrate/Deploy buttons below can use them
-    st.session_state.repo_path = str(repo_path)
-    st.session_state.result = result.stdout
+    job_id = job_runner.resume_or_new_job(repo_url)
+    existing_status = job_runner.get_step_status(job_id, "analyze")
+    if not existing_status or existing_status["status"] != "done":
+        job_runner.launch_step(job_id, "analyze", {"repo_url": repo_url})
     st.session_state.job_id = job_id
     st.session_state.repo_url = repo_url
 
-# Show findings + migrate/deploy sections if we have a completed analysis
-if st.session_state.result:
-    st.subheader("Findings")
-    st.markdown(st.session_state.result)
+job_id = st.session_state.job_id
 
-    report_path = Path("reports") / "latest_analysis.md"
-    if report_path.exists():
-        st.download_button(
-            "Download report (.md)",
-            data=report_path.read_text(encoding="utf-8"),
-            file_name="vulnerability_report.md",
-            mime="text/markdown",
-        )
+if job_id is not None:
+    job = db.get_job(job_id)
+    analyze_status = job_runner.get_step_status(job_id, "analyze")
 
-    st.divider()
-    st.subheader("Migrate to modern stack")
-    target_stack = st.text_input("Target stack", "Python FastAPI + React", key="target_stack")
-    scope_input = st.text_input("Which module/feature to migrate (e.g. 'ticketing')", "ticketing", key="scope_input")
-    output_repo_name = st.text_input("New output repo name", "migrated-app", key="output_repo_name")
+    if analyze_status and analyze_status["status"] == "running":
+        st.info("Analyzing with Claude Code... this page refreshes automatically.")
+        with st.expander("Worker log (live)"):
+            st.code(job_runner.get_worker_log(job_id, "analyze") or "(no output yet)")
+        time.sleep(2)
+        st.rerun()
 
-    if st.button("Run migration", key="run_migration_btn"):
-        with st.status("Migrating...", expanded=True):
-            try:
-                out_url, out_path = migrate_and_push(
-                    st.session_state.repo_path,
-                    st.session_state.result,
-                    target_stack,
-                    scope_input,
-                    output_repo_name,
-                )
-                db.save_migration(st.session_state.job_id, out_url)
+    elif analyze_status and analyze_status["status"] == "error":
+        st.error(f"Analysis failed:\n\n```\n{analyze_status['error'][-2000:]}\n```")
+
+    elif analyze_status and analyze_status["status"] == "done":
+        findings = job["findings"]
+        repo_path = job["repo_path"]
+
+        st.subheader("Findings")
+        st.markdown(findings)
+
+        report_path = Path("reports") / "latest_analysis.md"
+        if report_path.exists():
+            st.download_button(
+                "Download report (.md)",
+                data=report_path.read_text(encoding="utf-8"),
+                file_name="vulnerability_report.md",
+                mime="text/markdown",
+            )
+
+        st.divider()
+        st.subheader("Migrate to modern stack")
+        target_stack = st.text_input("Target stack", "Python FastAPI + React", key="target_stack")
+        scope_input = st.text_input("Which module/feature to migrate (e.g. 'ticketing')", "ticketing", key="scope_input")
+        output_repo_name = st.text_input("New output repo name", "migrated-app", key="output_repo_name")
+
+        migrate_status = job_runner.get_step_status(job_id, "migrate")
+        migrate_running = bool(migrate_status and migrate_status["status"] == "running")
+
+        if st.button("Run migration", key="run_migration_btn", disabled=migrate_running):
+            job_runner.launch_step(
+                job_id,
+                "migrate",
+                {
+                    "repo_path": repo_path,
+                    "findings": findings,
+                    "target_stack": target_stack,
+                    "scope": scope_input,
+                    "output_repo_name": output_repo_name,
+                },
+            )
+            st.rerun()
+
+        if migrate_status:
+            if migrate_status["status"] == "running":
+                st.info("Migrating... this page refreshes automatically.")
+                with st.expander("Worker log (live)"):
+                    st.code(job_runner.get_worker_log(job_id, "migrate") or "(no output yet)")
+                time.sleep(2)
+                st.rerun()
+            elif migrate_status["status"] == "error":
+                st.error(f"Migration failed:\n\n```\n{migrate_status['error'][-2000:]}\n```")
+            elif migrate_status["status"] == "done":
+                out_url = migrate_status["result"]["repo_url"]
                 st.success(f"Pushed to {out_url}")
-                st.session_state.output_repo_url = out_url
-                st.session_state.output_repo_path = out_path
-            except Exception as e:
-                st.error(str(e))
 
-    st.divider()
-    st.subheader("Deploy with Docker")
-    if st.button("Run deployment", key="run_deployment_btn"):
-        with st.status("Deploying...", expanded=True):
-            try:
-                target_path = st.session_state.get("output_repo_path", st.session_state.repo_path)
-                app_url = dockerize_and_run(target_path, container_name="migrated_app")
-                db.save_deployment(st.session_state.job_id, app_url)
+        st.divider()
+        st.subheader("Deploy with Docker")
+
+        # Deploy the migrated output if it exists, otherwise the original repo
+        deploy_target = repo_path
+        if migrate_status and migrate_status["status"] == "done":
+            deploy_target = migrate_status["result"]["repo_path"]
+
+        deploy_status = job_runner.get_step_status(job_id, "deploy")
+        deploy_running = bool(deploy_status and deploy_status["status"] == "running")
+
+        if st.button("Run deployment", key="run_deployment_btn", disabled=deploy_running):
+            job_runner.launch_step(
+                job_id,
+                "deploy",
+                {"target_path": deploy_target, "container_name": "migrated_app"},
+            )
+            st.rerun()
+
+        if deploy_status:
+            if deploy_status["status"] == "running":
+                st.info("Deploying... this page refreshes automatically.")
+                with st.expander("Worker log (live)"):
+                    st.code(job_runner.get_worker_log(job_id, "deploy") or "(no output yet)")
+                time.sleep(2)
+                st.rerun()
+            elif deploy_status["status"] == "error":
+                st.error(f"Deployment failed:\n\n```\n{deploy_status['error'][-2000:]}\n```")
+            elif deploy_status["status"] == "done":
+                app_url = deploy_status["result"]["app_url"]
                 st.success(f"App live at: {app_url}")
                 st.markdown(f"[Open App]({app_url})")
-            except Exception as e:
-                st.error(str(e))

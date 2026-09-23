@@ -1,124 +1,147 @@
-"""SQLite persistence for the harness pipeline: analysis, migration, deployment."""
+"""SQLite persistence for the agent harness. Two tables:
+
+  jobs  — one row per repo analysis session (repo_url, findings, migration/
+          deployment results)
+  steps — one row per (job_id, step_name) execution, updated live by
+          worker.py so a crash mid-run still leaves an accurate status
+          to resume from.
+"""
 
 from __future__ import annotations
 
 import sqlite3
-import uuid
+import time
 from pathlib import Path
-from datetime import datetime
+from contextlib import contextmanager
 
 DB_PATH = Path("harness_data.db")
 
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+@contextmanager
+def _conn():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    return conn
+    conn.execute("PRAGMA journal_mode=WAL")  # allow concurrent reader (Streamlit) + writer (worker)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def init_db():
-    conn = get_conn()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS jobs (
-        id TEXT PRIMARY KEY,
-        repo_url TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'created',
-        created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS findings (
-        job_id TEXT PRIMARY KEY,
-        content_md TEXT,
-        created_at TEXT,
-        FOREIGN KEY (job_id) REFERENCES jobs(id)
-    );
-    CREATE TABLE IF NOT EXISTS migration (
-        job_id TEXT PRIMARY KEY,
-        output_repo_url TEXT,
-        status TEXT DEFAULT 'pending',
-        updated_at TEXT,
-        FOREIGN KEY (job_id) REFERENCES jobs(id)
-    );
-    CREATE TABLE IF NOT EXISTS deployment (
-        job_id TEXT PRIMARY KEY,
-        docker_status TEXT DEFAULT 'pending',
-        app_url TEXT,
-        updated_at TEXT,
-        FOREIGN KEY (job_id) REFERENCES jobs(id)
-    );
-    """)
-    conn.commit()
-    conn.close()
+def init_db() -> None:
+    with _conn() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_url        TEXT NOT NULL,
+                repo_path       TEXT,
+                findings        TEXT,
+                migration_url   TEXT,
+                deployment_url  TEXT,
+                created_at      REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS steps (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      INTEGER NOT NULL REFERENCES jobs(id),
+                step_name   TEXT NOT NULL,       -- 'analyze' | 'migrate' | 'deploy'
+                status      TEXT NOT NULL,       -- 'running' | 'done' | 'error'
+                result      TEXT,                -- JSON-ish string payload, step-specific
+                error       TEXT,
+                started_at  REAL NOT NULL,
+                updated_at  REAL NOT NULL,
+                UNIQUE(job_id, step_name)
+            );
+            """
+        )
 
 
-def create_job(repo_url: str) -> str:
-    job_id = str(uuid.uuid4())
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO jobs (id, repo_url, status, created_at) VALUES (?, ?, ?, ?)",
-        (job_id, repo_url, "created", datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    conn.close()
-    return job_id
+# ---------------------------------------------------------------- jobs ----
+
+def create_job(repo_url: str) -> int:
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO jobs (repo_url, created_at) VALUES (?, ?)",
+            (repo_url, time.time()),
+        )
+        return cur.lastrowid
 
 
-def update_job_status(job_id: str, status: str):
-    conn = get_conn()
-    conn.execute("UPDATE jobs SET status=? WHERE id=?", (status, job_id))
-    conn.commit()
-    conn.close()
+def get_job(job_id: int) -> sqlite3.Row | None:
+    with _conn() as conn:
+        return conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
 
 
-def save_findings(job_id: str, content_md: str):
-    conn = get_conn()
-    conn.execute(
-        "INSERT OR REPLACE INTO findings (job_id, content_md, created_at) VALUES (?, ?, ?)",
-        (job_id, content_md, datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    conn.close()
-    update_job_status(job_id, "analyzed")
+def save_repo_path(job_id: int, repo_path: str) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE jobs SET repo_path = ? WHERE id = ?", (repo_path, job_id))
 
 
-def save_migration(job_id: str, output_repo_url: str, status: str = "complete"):
-    conn = get_conn()
-    conn.execute(
-        "INSERT OR REPLACE INTO migration (job_id, output_repo_url, status, updated_at) VALUES (?, ?, ?, ?)",
-        (job_id, output_repo_url, status, datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    conn.close()
-    update_job_status(job_id, "migrated")
+def save_findings(job_id: int, findings: str) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE jobs SET findings = ? WHERE id = ?", (findings, job_id))
 
 
-def save_deployment(job_id: str, app_url: str, docker_status: str = "complete"):
-    conn = get_conn()
-    conn.execute(
-        "INSERT OR REPLACE INTO deployment (job_id, docker_status, app_url, updated_at) VALUES (?, ?, ?, ?)",
-        (job_id, docker_status, app_url, datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    conn.close()
-    update_job_status(job_id, "deployed")
+def save_migration(job_id: int, migration_url: str) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE jobs SET migration_url = ? WHERE id = ?", (migration_url, job_id))
 
 
-def get_job_full(job_id: str) -> dict:
-    conn = get_conn()
-    job = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-    findings = conn.execute("SELECT * FROM findings WHERE job_id=?", (job_id,)).fetchone()
-    migration = conn.execute("SELECT * FROM migration WHERE job_id=?", (job_id,)).fetchone()
-    deployment = conn.execute("SELECT * FROM deployment WHERE job_id=?", (job_id,)).fetchone()
-    conn.close()
-    return {
-        "job": dict(job) if job else None,
-        "findings": dict(findings) if findings else None,
-        "migration": dict(migration) if migration else None,
-        "deployment": dict(deployment) if deployment else None,
-    }
+def save_deployment(job_id: int, deployment_url: str) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE jobs SET deployment_url = ? WHERE id = ?", (deployment_url, job_id))
 
 
-def list_jobs() -> list[dict]:
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+def find_latest_job_for_repo(repo_url: str) -> sqlite3.Row | None:
+    """Used on Streamlit restart to resume a job instead of starting fresh."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM jobs WHERE repo_url = ? ORDER BY created_at DESC LIMIT 1",
+            (repo_url,),
+        ).fetchone()
+
+
+# --------------------------------------------------------------- steps ----
+
+def start_step(job_id: int, step_name: str) -> None:
+    now = time.time()
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO steps (job_id, step_name, status, started_at, updated_at)
+            VALUES (?, ?, 'running', ?, ?)
+            ON CONFLICT(job_id, step_name) DO UPDATE SET
+                status = 'running', result = NULL, error = NULL,
+                started_at = excluded.started_at, updated_at = excluded.updated_at
+            """,
+            (job_id, step_name, now, now),
+        )
+
+
+def finish_step(job_id: int, step_name: str, status: str, result: str = "", error: str = "") -> None:
+    assert status in ("done", "error")
+    with _conn() as conn:
+        conn.execute(
+            """
+            UPDATE steps SET status = ?, result = ?, error = ?, updated_at = ?
+            WHERE job_id = ? AND step_name = ?
+            """,
+            (status, result, error, time.time(), job_id, step_name),
+        )
+
+
+def get_step(job_id: int, step_name: str) -> sqlite3.Row | None:
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM steps WHERE job_id = ? AND step_name = ?",
+            (job_id, step_name),
+        ).fetchone()
+
+
+def get_all_steps(job_id: int) -> list[sqlite3.Row]:
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM steps WHERE job_id = ? ORDER BY started_at", (job_id,)
+        ).fetchall()

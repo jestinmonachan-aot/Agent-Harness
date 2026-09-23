@@ -4,33 +4,42 @@
 
 ## Findings
 
-This confirms the CSRF architecture is sound â€” no finding here. I have sufficient coverage now to compile the report.
+Good, dependabot and SECURITY.md are present. I have enough to compile the findings.
 
-## Security Assessment â€” GLPI (`11.0/bugfixes`)
+## Security Analysis: GLPI (11.0.10-dev, branch `11.0/bugfixes`)
 
-Codebase identified as **GLPI** (open-source IT asset/service management, PHP), on a fully modernized stack (PHP â‰¥8.2, Symfony 6.4 components, PHPUnit 11). Overall posture is strong â€” this is a mature project with an active security disclosure process (`SECURITY.md`). No urgent blockers found, but several items are worth tracking for the migration.
+**Overall posture:** This is a mature, actively-maintained codebase with good security hygiene already in place â€” not a typical "legacy" system with latent rot. Findings below are mostly low-severity or environmental, not exploitable code-level flaws.
 
-**1. Dependencies â€” clean, no action needed**
-`composer audit --locked` and `npm audit` against the committed lockfiles both return **zero known vulnerabilities**. All major deps (Symfony 6.4, Guzzle 7.15, TCPDF 6.11, Twig 3.27, PHPSpreadsheet 5.1, sabre/dav 4.7) are current major versions, not EOL branches. `laminas/laminas-mail` and `laminas/laminas-loader` are flagged **abandoned** upstream but explicitly allow-listed in `composer.json` (`ignore-abandoned`) â€” worth a forward-looking replacement plan since abandoned packages won't receive future CVE patches.
+### Dependencies
+- `composer audit --locked` â†’ **0 advisories**. `npm audit` â†’ **0 vulnerabilities**. Both lockfiles are current at HEAD.
+- `dependabot.yml` present and configured â€” dependency drift will be caught automatically going forward.
+- Two vendor patches are auto-applied post-install (`tools/patches/guzzlehttp-guzzle-restrict-http-methods.patch`, `laminas-mail-invalid-header-ignore.patch`) â€” confirm these still apply cleanly after any dependency bump; a silently-failing patch would reintroduce the issues they fix.
+- `composer.json` marks `laminas/laminas-mail` as an ignored-abandoned package (`audit.ignore-abandoned`) â€” it's unmaintained upstream. Worth tracking as a migration risk since it won't receive future security patches.
 
-**2. Hardcoded credentials â€” dev-only, but flag for migration hygiene**
-- `docker-compose.yaml`: weak default creds (`glpi`/`glpi` DB user+root, LDAP `admin`/`admin`) â€” standard for the local dev compose stack, not shipped to production config, low risk but confirm no CI/staging environment reuses this compose file unmodified.
-- `install/empty_data.php:9419-9421`: seeds a default `glpi`/`glpi` account (properly hashed via `password_hash`) as part of the fresh-install fixture data â€” this is intentional GLPI installer behavior (along with `tech`/`post-only`/`normal` defaults), but **must be rotated/disabled before any migrated instance goes live**, since it's a well-known target for credential-stuffing scans against GLPI installs.
+### Injection risk
+- Direct SQL: `DBmysql::query()` is intentionally hard-disabled (`throw new Exception('Executing direct queries is not allowed!')`), forcing all DB access through the parameterized query builder (`DBmysql::doQuery()` + builder methods) â€” good defense-in-depth against SQL injection.
+- LDAP: filter construction in `src/AuthLDAP.php` consistently uses `ldap_escape($value, '', LDAP_ESCAPE_FILTER)` before interpolating user input into filter strings (lines ~3467, ~3840) â€” no obvious LDAP injection path in the spots checked.
+- No use of `eval()`, `system()`, `exec()`, `passthru()`, or `shell_exec()` found in `src/` during targeted search.
 
-**3. Authentication â€” solid**
-`src/Auth.php` uses `password_hash()`/`password_verify()` with `PASSWORD_DEFAULT` (bcrypt/argon2 per PHP config) â€” no legacy MD5/SHA1 password hashing found anywhere in `src/`. TOTP 2FA support present (`Glpi\Security\TOTPManager`).
+### XML parsing (XXE)
+- `src/Glpi/Agent/Communication/AbstractRequest.php` (inventory agent XML ingestion) and `src/KnowbaseItem.php` (HTML sanitization) use `simplexml_load_string()` / `DOMDocument` without explicit `LIBXML_NONET`/entity-loader hardening. Not currently exploitable since PHP â‰¥8.2 is required (composer.json) and libxml has disabled external entity loading by default since PHP 5.4.30/8.0 â€” but this is implicit safety from the PHP version floor, not explicit code defense. Worth a comment/assertion if the migration ever considers supporting older PHP.
 
-**4. CSRF â€” centralized correctly**
-CSRF is enforced via a single Symfony kernel listener (`CheckCsrfListener`) that fires on every main request, including legacy `front/*.php` and `ajax/*.php` scripts, which are routed through the same HTTP kernel/firewall (`Glpi\Http\Firewall`, `RequestRouterTrait`) rather than being separate unprotected entry points. No bypass found.
+### Auth / session
+- `session.cookie_httponly` is force-set via `SystemConfigurator`; `session.cookie_secure` is checked at runtime with an explicit warning (`SessionsSecurityConfiguration`) if HTTPS is in use but the flag isn't set â€” reasonable posture, though it's advisory rather than enforced.
+- 2FA (`TOTPManager`), CAS, SAML/OAuth2 (`league/oauth2-*`), and Altcha CAPTCHA are all present as first-class, actively-versioned dependencies.
 
-**5. Injection surfaces checked â€” no exploitable pattern found**
-- No raw string-concatenated SQL reaching `mysqli::query()`; the handful of direct `->query()` calls in `DBmysql.php` are internal driver plumbing fed by the parameterized query builder, with dynamic values passed through `$this->quote()`.
-- `eval()`/`unserialize()` hits in `src/` are false positives (`DOMXPath::query()`, a JS-string comment mentioning `eval()`), not PHP code execution sinks.
-- Sampled `ajax/*.php` scripts using `$_POST` string concatenation apply proper sanitization (`Html::cleanId()`, `(int)` casts) before use.
-- LDAP auth (`AuthLDAP.php`) isn't deeply audited here â€” worth a dedicated pass on `ldap_search`/`ldap_bind` filter construction if LDAP auth is in scope for the migrated environment, since LDAP filter injection is a recurring historical bug class for this integration.
+### Hardcoded secrets
+- No secrets found in `config/` (properly gitignored â€” only `.gitkeep` tracked; real config is generated at install time).
+- `docker-compose.yaml` and `tests/e2e/.env` contain **weak default credentials** (`glpi/glpi`, LDAP `admin/admin`) â€” these are dev/CI-only and not shipped to production, but flag explicitly if this compose file is ever reused as a deployment template.
 
-**6. Migration-blocker considerations (not vulnerabilities, but relevant)**
-- Runtime requires PHP â‰¥8.2 and Node â‰¥20.9 â€” confirm target infra meets this before cutover.
-- `laminas/laminas-mail` abandoned status (see #1) is the one dependency-freshness item that should have an owner/ticket rather than a silent audit-suppression.
+### Migration-blocking observations
+- **Local PHP mismatch**: the PHP binary on this machine is 7.2.34, but `composer.json` requires `php: >=8.2`. Not a codebase vulnerability, but this environment cannot run the app as-is â€” flag before any local verification/testing step.
+- `.phpstan-baseline.php` is ~20,000 lines / 873 KB of suppressed static-analysis findings (plus a 1.5 MB `missingType.iterableValue` baseline). These are pre-existing type-safety gaps that PHPStan would otherwise flag â€” not confirmed vulnerabilities, but a large blind spot that should be burned down incrementally during modernization rather than treated as permanently suppressed.
+- `laminas/laminas-mail` (abandoned upstream, see above) is a concrete dependency-lifecycle risk for the migration plan.
 
-**Bottom line:** no critical/high-severity code vulnerabilities or outdated-CVE dependencies found in this snapshot. The only real pre-migration action items are (a) confirming default `glpi`/`glpi`/`admin` seed credentials get rotated in any migrated environment, and (b) tracking a replacement for the abandoned `laminas/laminas-mail` dependency.
+### Not found / ruled out
+- No hardcoded API keys/passwords in source.
+- No raw `unserialize()` of untrusted input in the areas searched.
+- No evidence of disabled TLS verification or auth bypass flags in the files reviewed.
+
+**Recommendation:** given the clean audit results and disciplined query-builder/escaping patterns, prioritize (1) a plan to replace or vendor-fork `laminas/laminas-mail`, (2) reducing the PHPStan baseline rather than growing it further, and (3) confirming the two vendor patches survive the next dependency bump â€” rather than searching for injection-class bugs, which this pass didn't surface.
