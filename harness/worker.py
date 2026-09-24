@@ -23,8 +23,15 @@ from harness.repo_utils import clone_repo
 from harness.claude_cli import run_claude_prompt
 from harness.md_utils import generate_pdf_report, extract_json_findings
 from harness.skills import build_analysis_prompt
-from harness.migrate import migrate_and_push
+from harness.migrate import migrate_and_push, UsageLimitError
 from harness.deploy import dockerize_and_run
+
+# Marker prefix used to encode a resumable usage-limit failure into the
+# plain-text `error` column app.py already reads. Kept as a simple string
+# marker (rather than a DB schema change) so this works with the existing
+# db.finish_step(..., error=<str>) signature. Format:
+#   RESUMABLE_USAGE_LIMIT::<output_dir>::<human message>
+USAGE_LIMIT_MARKER = "RESUMABLE_USAGE_LIMIT::"
 
 
 def run_analyze(job_id: str, params: dict) -> str:
@@ -57,6 +64,7 @@ def run_migrate(job_id: str, params: dict) -> str:
     repo_path = params["repo_path"]
     findings = params["findings"]
     scope = params.get("scope", "full app")
+    resume_output_dir = params.get("resume_output_dir")  # set by app.py's "Resume migration"
 
     # findings may already be a list (from run_analyze's new structured
     # output) or a JSON string (from db.get_job's stored TEXT column) —
@@ -76,8 +84,14 @@ def run_migrate(job_id: str, params: dict) -> str:
     else:
         findings_md = str(findings)
 
+    if resume_output_dir:
+        print(f"[migrate] Resuming migration from {resume_output_dir}", flush=True)
+
+    # UsageLimitError deliberately propagates up uncaught — main() below
+    # handles it specially so a usage limit is recorded as resumable
+    # rather than as a generic failure.
     out_url, out_path, stack_chosen, stack_reasoning = migrate_and_push(
-        repo_path, findings_md, scope
+        repo_path, findings_md, scope, resume_output_dir=resume_output_dir,
     )
     db.save_migration(job_id, out_url)
 
@@ -127,6 +141,14 @@ def main() -> None:
     try:
         result = func(job_id, params)
         db.finish_step(job_id, step_name, "done", result=result)
+    except UsageLimitError as e:
+        # Encode as resumable so app.py can offer "Resume migration"
+        # instead of just showing a dead-end failure.
+        db.finish_step(
+            job_id, step_name, "error",
+            error=f"{USAGE_LIMIT_MARKER}{e.output_dir}::{e}",
+        )
+        sys.exit(1)
     except Exception:
         db.finish_step(job_id, step_name, "error", error=traceback.format_exc())
         sys.exit(1)

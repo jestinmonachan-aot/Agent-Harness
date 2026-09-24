@@ -5,7 +5,10 @@ Streamlit UI for the agent harness workflow:
   3. We call Claude Code CLI to analyze it (focused on selected skills)
   4. We parse structured findings + display them, and generate a PDF report
   5. Migrate: Claude picks the best modern stack itself, migrates,
-     pushes to AOT-Technologies/harness-new (new branch per migration)
+     pushes to AOT-Technologies/harness-new (new branch per migration).
+     Full-app migrations are done module-by-module with a resumable
+     state file, so a Claude usage/rate limit mid-run can be resumed
+     instead of starting over.
   6. Optionally dockerize + deploy -> show URL
 
 Each step runs in a fully detached worker process (see harness/worker.py +
@@ -24,6 +27,11 @@ from harness import db, job_runner
 from harness.claude_cli import check_claude_available
 from harness.skills import SKILLS
 from harness.md_utils import generate_pdf_report
+
+# Marker prefix worker.py writes into the stored error text when a
+# migration failure looks like a Claude usage/rate limit rather than a
+# genuine failure. Must match harness.worker.USAGE_LIMIT_MARKER.
+USAGE_LIMIT_MARKER = "RESUMABLE_USAGE_LIMIT::"
 
 st.set_page_config(page_title="Agent Harness — Vulnerability Scan", layout="wide")
 db.init_db()
@@ -91,12 +99,12 @@ if job_id is not None:
         repo_path = result_data["repo_path"]
         pdf_path = result_data.get("pdf_path")
         skills_used = result_data.get("skills_used", [])
-    
+
         st.subheader("Findings")
-    
+
         severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
         severity_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢", "info": "⚪"}
-    
+
         # --- Summary counts, for the non-technical reader ---
         if findings:
             counts = {}
@@ -108,21 +116,20 @@ if job_id is not None:
                 for s in ["critical", "high", "medium", "low", "info"] if s in counts
             ]
             st.markdown("**Summary:** " + "  ·  ".join(summary_parts))
-    
+
         if not findings:
             st.info("No issues found.")
         else:
             # --- Group findings by category/skill, so each selected skill gets its own section ---
-            from harness.skills import SKILLS
             grouped = {}
             for f in findings:
                 cat = f.get("category", "general")
                 grouped.setdefault(cat, []).append(f)
-    
+
             # Show selected skills first (in the order the user picked them), then any leftover categories
             ordered_categories = [s for s in skills_used if s in grouped] + \
                                   [c for c in grouped if c not in skills_used]
-    
+
             for cat in ordered_categories:
                 cat_label = SKILLS.get(cat, {}).get("label", cat.replace("_", " ").title())
                 cat_findings = sorted(grouped[cat], key=lambda x: severity_order.get(x.get("severity", "info"), 4))
@@ -137,12 +144,17 @@ if job_id is not None:
                         st.write(f.get("description", ""))
                         if f.get("recommendation"):
                             st.info(f"**Recommendation:** {f.get('recommendation')}")
-    
+
         pdf_path = Path("reports") / f"analysis_report_{job_id}.pdf"
-        
-        # Always regenerate fresh right before offering the download
-        generate_pdf_report(pdf_path, st.session_state.repo_url, findings, skills_used)
-        
+
+        # Regenerate only when findings actually changed, so migrate/deploy
+        # polling reruns don't re-render the PDF on every 2s tick.
+        findings_key = f"pdf_findings_hash_{job_id}"
+        current_hash = hash(str(findings))
+        if st.session_state.get(findings_key) != current_hash:
+            generate_pdf_report(pdf_path, st.session_state.repo_url, findings, skills_used)
+            st.session_state[findings_key] = current_hash
+
         st.download_button(
             "Download report (PDF)",
             data=pdf_path.read_bytes(),
@@ -154,6 +166,11 @@ if job_id is not None:
         st.divider()
         st.subheader("Migrate to a modern stack")
         st.caption("Claude analyzes the app and chooses the best-fit modern stack itself — you don't pick it.")
+        st.caption(
+            "For a full-app migration, Claude breaks the app into modules and "
+            "migrates them one at a time, then assembles a final app — this "
+            "can take a while for large apps, but progress is saved as it goes."
+        )
         scope_input = st.text_input(
             "Which module/feature to migrate (leave blank or type 'full app' for the entire application)",
             "full app",
@@ -164,26 +181,54 @@ if job_id is not None:
         migrate_running = bool(migrate_status and migrate_status["status"] == "running")
         migrate_done = bool(migrate_status and migrate_status["status"] == "done")
 
-        if st.button("Run migration", key="run_migration_btn", disabled=migrate_running or migrate_done):
-            job_runner.launch_step(
-                job_id,
-                "migrate",
-                {
-                    "repo_path": repo_path,
-                    "findings": findings,
-                    "scope": scope_input,
-                },
+        # Detect a resumable usage-limit failure from a previous attempt, so
+        # we can offer "Resume migration" instead of "Run migration".
+        resume_output_dir = None
+        if migrate_status and migrate_status["status"] == "error" and migrate_status["error"]:
+            err_text = migrate_status["error"]
+            if err_text.startswith(USAGE_LIMIT_MARKER):
+                rest = err_text[len(USAGE_LIMIT_MARKER):]
+                resume_output_dir, _, _human_msg = rest.partition("::")
+
+        if resume_output_dir:
+            st.warning(
+                "Migration paused — looks like a Claude usage/rate limit was hit "
+                "partway through. Progress so far (completed modules) is saved; "
+                "you can pick up where it left off instead of starting over."
             )
-            st.rerun()
+            if st.button("Resume migration", key="resume_migration_btn"):
+                job_runner.launch_step(
+                    job_id,
+                    "migrate",
+                    {
+                        "repo_path": repo_path,
+                        "findings": findings,
+                        "scope": scope_input,
+                        "resume_output_dir": resume_output_dir,
+                    },
+                )
+                st.rerun()
+        else:
+            if st.button("Run migration", key="run_migration_btn", disabled=migrate_running or migrate_done):
+                job_runner.launch_step(
+                    job_id,
+                    "migrate",
+                    {
+                        "repo_path": repo_path,
+                        "findings": findings,
+                        "scope": scope_input,
+                    },
+                )
+                st.rerun()
 
         if migrate_status:
             if migrate_status["status"] == "running":
                 st.info("Migrating... this page refreshes automatically.")
-                with st.expander("Worker log (live)"):
+                with st.expander("Worker log (live)", expanded=True):
                     st.code(job_runner.get_worker_log(job_id, "migrate") or "(no output yet)")
                 time.sleep(2)
                 st.rerun()
-            elif migrate_status["status"] == "error":
+            elif migrate_status["status"] == "error" and not resume_output_dir:
                 st.error(f"Migration failed:\n\n```\n{migrate_status['error'][-2000:]}\n```")
             elif migrate_status["status"] == "done":
                 m_result = migrate_status["result"]
