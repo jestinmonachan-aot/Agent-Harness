@@ -70,6 +70,8 @@ def run_claude_prompt(
             input=prompt,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             shell=(sys.platform == "win32"),
         )

@@ -21,51 +21,75 @@ from pathlib import Path
 from harness import db
 from harness.repo_utils import clone_repo
 from harness.claude_cli import run_claude_prompt
-from harness.md_utils import save_analysis_report
+from harness.md_utils import generate_pdf_report, extract_json_findings
+from harness.skills import build_analysis_prompt
 from harness.migrate import migrate_and_push
 from harness.deploy import dockerize_and_run
 
 
-def run_analyze(job_id: int, params: dict) -> str:
+def run_analyze(job_id: str, params: dict) -> str:
     repo_url = params["repo_url"]
+    selected_skills = params.get("skills") or ["security"]
 
     repo_path = clone_repo(repo_url)
     db.save_repo_path(job_id, str(repo_path))
 
-    prompt = (
-        f"You are analyzing the codebase at {repo_path} for a legacy "
-        "modernization migration. Identify security vulnerabilities: "
-        "outdated dependencies, injection risks, hardcoded secrets, "
-        "insecure auth, and anything blocking a safe migration. "
-        "Return a concise, structured list of findings."
-    )
+    prompt = build_analysis_prompt(str(repo_path), selected_skills)
     result = run_claude_prompt(prompt, cwd=str(repo_path), timeout=1200)
     if not result.success:
         raise RuntimeError(result.stderr or "Claude CLI analysis failed")
 
-    db.save_findings(job_id, result.stdout)
-    report_path = Path("reports") / "latest_analysis.md"
-    save_analysis_report(report_path, repo_url, result.stdout)
+    findings_list = extract_json_findings(result.stdout)
+    db.save_findings(job_id, json.dumps(findings_list))
 
-    return json.dumps({"repo_path": str(repo_path), "findings": result.stdout})
+    pdf_path = Path("reports") / f"analysis_report_{job_id}.pdf"
+    generate_pdf_report(pdf_path, repo_url, findings_list, selected_skills)
+
+    return json.dumps({
+        "repo_path": str(repo_path),
+        "findings": findings_list,
+        "skills_used": selected_skills,
+        "pdf_path": str(pdf_path),
+    })
 
 
-def run_migrate(job_id: int, params: dict) -> str:
+def run_migrate(job_id: str, params: dict) -> str:
     repo_path = params["repo_path"]
     findings = params["findings"]
-    target_stack = params["target_stack"]
-    scope = params["scope"]
-    output_repo_name = params["output_repo_name"]
+    scope = params.get("scope", "full app")
 
-    out_url, out_path = migrate_and_push(
-        repo_path, findings, target_stack, scope, output_repo_name
+    # findings may already be a list (from run_analyze's new structured
+    # output) or a JSON string (from db.get_job's stored TEXT column) —
+    # normalize to a markdown-ish string for the migration prompt.
+    if isinstance(findings, str):
+        try:
+            findings = json.loads(findings)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    if isinstance(findings, list):
+        findings_md = "\n".join(
+            f"- [{f.get('severity', 'info').upper()}] {f.get('title', '')}: "
+            f"{f.get('description', '')}"
+            for f in findings
+        )
+    else:
+        findings_md = str(findings)
+
+    out_url, out_path, stack_chosen, stack_reasoning = migrate_and_push(
+        repo_path, findings_md, scope
     )
     db.save_migration(job_id, out_url)
 
-    return json.dumps({"repo_url": out_url, "repo_path": out_path})
+    return json.dumps({
+        "repo_url": out_url,
+        "repo_path": out_path,
+        "stack_chosen": stack_chosen,
+        "stack_reasoning": stack_reasoning,
+    })
 
 
-def run_deploy(job_id: int, params: dict) -> str:
+def run_deploy(job_id: str, params: dict) -> str:
     target_path = params["target_path"]
     container_name = params["container_name"]
 

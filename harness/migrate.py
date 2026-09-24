@@ -1,9 +1,9 @@
 """Migration step: copy the input repo, ask Claude to apply targeted
-fixes only to legacy/vulnerable parts, then push to a NEW output repo
-(never touches the input repo)."""
+fixes to the app (one scoped module, or the entire application), then
+push to a NEW output repo (never touches the input repo)."""
 
 from __future__ import annotations
-
+import re
 import subprocess
 import shutil
 import tempfile
@@ -27,99 +27,77 @@ def create_github_repo(repo_name: str, private: bool = True) -> str:
     return url_line or f"https://github.com/<your-user>/{repo_name}"
 
 
+def _build_prompt(input_repo_path: str, findings_md: str, scope: str | None) -> str:
+    full_app = not scope or scope.strip().lower() in ("full app", "entire application", "all", "*")
+    scope_desc = "the ENTIRE application" if full_app else f"ONLY the '{scope}' feature/module"
+
+    return (
+        f"You are migrating {scope_desc} of a legacy application to a "
+        f"modern tech stack of YOUR CHOOSING. Analyze the codebase and pick "
+        f"the best-fit modern stack (e.g. FastAPI+React, Django+Vue, "
+        f"Spring Boot+Angular, etc.) based on what the app actually needs "
+        f"(current language ecosystem, team-friendliness, app complexity). "
+        f"This is not optional — you must choose one and justify it.\n\n"
+        f"Legacy source (read-only, do not modify): {input_repo_path}\n\n"
+        f"Known vulnerabilities/issues to fix during the rewrite:\n{findings_md}\n\n"
+        "REQUIREMENTS:\n"
+        "1. Analyze the legacy code, pick the best modern stack, and write "
+        "STACK_DECISION.md explaining your choice and reasoning in plain, "
+        "clear language (a paragraph or two).\n"
+        "2. Reimplement the scoped app/feature from scratch in the chosen "
+        "stack — new folder structure, not a patch on the legacy code.\n"
+        "3. Preserve the exact existing UX (fields, flows, validation, look).\n"
+        "4. Fix the listed vulnerabilities as part of the rewrite.\n"
+        "5. Do NOT modify anything at the legacy source path.\n"
+        "6. Write MIGRATION_NOTES.md summarizing what was migrated.\n"
+        "7. As the LAST LINE of your final response, output exactly:\n"
+        "STACK_CHOSEN: <short stack name>\n"
+    )
+
+
 def migrate_and_push(
     input_repo_path: str,
     findings_md: str,
-    target_stack: str,
-    scope: str,
-    output_repo_name: str,
-) -> tuple[str, str]:
-    """
-    Rewrites ONE scoped feature/module of the legacy app into a new
-    tech stack, while preserving the exact existing UX (fields, flows,
-    validation, look-and-feel) and fixing known vulnerabilities.
-    Pushes the result to a brand-new GitHub repo. Input repo is never
-    modified.
-
-    Returns (repo_url, local_output_path).
-    """
+    scope: str | None,
+    timeout: int | None = None,
+) -> tuple[str, str, str, str]:
+    """Returns (repo_url, local_output_path, stack_chosen, stack_reasoning)."""
     output_dir = Path(tempfile.mkdtemp(prefix="migration_output_"))
-
-    prompt = (
-        f"You are migrating ONE scoped feature of a legacy application to "
-        f"a new tech stack: {target_stack}.\n\n"
-        f"Legacy source (read-only, do not modify): {input_repo_path}\n"
-        f"Scope: ONLY the '{scope}' feature/module — nothing else.\n\n"
-        f"Known vulnerabilities/issues to fix during the rewrite:\n{findings_md}\n\n"
-        f"THIS IS NOT A PATCH. You must NOT just add a fix to the existing "
-        f"PHP code. You must write entirely NEW code in {target_stack} that "
-        f"reimplements this feature from scratch — new backend files, new "
-        f"frontend files, in a completely new folder structure. Do NOT edit "
-        f"or add to any existing PHP file. Do NOT copy the legacy repo "
-        f"structure. Start with a blank {target_stack} project scaffold.\n\n"
-        f"CRITICAL REQUIREMENTS:\n"
-        f"1. Step 1 — Analyze: read the legacy code for '{scope}' at "
-        f"{input_repo_path}. Identify every screen, field, form, validation "
-        f"rule, button/action, navigation flow, and displayed data for this "
-        f"feature.\n"
-        f"2. Step 2 — Preserve UX: the new app must look and behave "
-        f"IDENTICALLY to the legacy version for this feature — same fields, "
-        f"same labels, same validation rules, same page flow, same visual "
-        f"layout (recreate the HTML/CSS to match, not just similar). A user "
-        f"should not notice any visual or functional difference.\n"
-        f"3. Step 3 — Rewrite in new stack: implement the backend and "
-        f"frontend for this feature using {target_stack}. Do not just "
-        f"scaffold folders — write complete, working, runnable code: routes, "
-        f"models/schemas, business logic, and UI components.\n"
-        f"4. Step 4 — Fix vulnerabilities: apply secure coding practices for "
-        f"the issues listed above (parameterized queries, input validation, "
-        f"no hardcoded secrets, etc.) as part of the rewrite.\n"
-        f"5. Do NOT modify anything at {input_repo_path} — read-only "
-        f"reference only.\n"
-        f"6. Write a MIGRATION_NOTES.md summarizing what was migrated, what "
-        f"UX elements were preserved, and what vulnerabilities were fixed.\n\n"
-        f"Write all code into your current working directory (empty right "
-        f"now). Start by listing/reading the legacy '{scope}' files, then "
-        f"build the new-stack version."
-    )
+    full_app = not scope or scope.strip().lower() in ("full app", "entire application", "all", "*")
+    prompt = _build_prompt(input_repo_path, findings_md, scope)
+    effective_timeout = timeout if timeout is not None else (3600 if full_app else 1800)
 
     result = run_claude_prompt(
-        prompt,
-        cwd=str(output_dir),
-        timeout=1800,
+        prompt, cwd=str(output_dir), timeout=effective_timeout,
         extra_args=["--add-dir", str(input_repo_path)],
     )
     if not result.success:
-        raise RuntimeError(
-            f"Migration prompt failed. returncode={result.returncode}, "
-            f"stdout={result.stdout[:500]!r}, stderr={result.stderr[:500]!r}"
-        )
+        raise RuntimeError(f"Migration prompt failed. returncode={result.returncode}, stdout={result.stdout[:500]!r}")
 
-    written_files = [
-        p for p in output_dir.rglob("*")
-        if p.is_file() and ".git" not in p.parts
-    ]
+    stack_match = re.search(r"STACK_CHOSEN:\s*(.+)", result.stdout)
+    stack_chosen = stack_match.group(1).strip() if stack_match else "unknown"
+
+    decision_file = output_dir / "STACK_DECISION.md"
+    stack_reasoning = decision_file.read_text(encoding="utf-8") if decision_file.exists() else ""
+
+    written_files = [p for p in output_dir.rglob("*") if p.is_file() and ".git" not in p.parts]
     if not written_files:
-        raise RuntimeError(
-            "Claude Code produced no output files in the migration folder. "
-            f"CLI stdout was: {result.stdout[:500]}"
-        )
+        raise RuntimeError(f"Claude Code produced no output files. stdout: {result.stdout[:500]}")
 
-    unique_repo_name = f"{output_repo_name}-{int(time.time())}"
-    repo_url = create_github_repo(unique_repo_name)
+    branch_name = f"migration-{int(time.time())}"
+    target_repo = "https://github.com/jestinmonachan-aot/harness-new-test.git"
 
     def run_git(*args):
-        proc = subprocess.run(
-            ["git", *args], cwd=output_dir, capture_output=True, text=True
-        )
+        proc = subprocess.run(["git", *args], cwd=output_dir, capture_output=True, text=True)
         if proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr}")
 
     run_git("init")
     run_git("add", ".")
-    run_git("commit", "-m", "Modernized migration: new stack, preserved UX, fixed vulnerabilities")
-    run_git("branch", "-M", "main")
-    run_git("remote", "add", "origin", repo_url)
-    run_git("push", "-u", "origin", "main")
+    run_git("commit", "-m", f"Modernized migration ({stack_chosen}): {scope or 'full app'}")
+    run_git("branch", "-M", branch_name)
+    run_git("remote", "add", "origin", target_repo)
+    run_git("push", "-u", "origin", branch_name)
 
-    return repo_url, str(output_dir)
+    repo_url = f"https://github.com/jestinmonachan-aot/harness-new-test/tree/{branch_name}"
+    return repo_url, str(output_dir), stack_chosen, stack_reasoning

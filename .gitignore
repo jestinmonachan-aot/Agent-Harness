@@ -10,3 +10,11 @@ migrated-app-*/
 migration_output_*/
 
 streamlit_log.txt
+
+cat >> .gitignore << 'EOF'
+reports/*.pdf
+*.log
+findings_export.json
+check_step.py
+clear_step.py
+EOF

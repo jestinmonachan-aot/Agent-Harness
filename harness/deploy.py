@@ -21,7 +21,8 @@ def _find_dockerfiles(root: Path) -> dict:
     }
 
 
-def _generate_compose(root: Path, backend_port: int = 8000, frontend_port: int = 80) -> Path:
+def _generate_compose(root: Path, backend_port: int = 8000, frontend_port: int = 80,
+                       host_frontend_port: int = 8500) -> Path:
     """Minimal compose file for a backend/ + frontend/ split, when Claude
     created per-service Dockerfiles but no compose to wire them together."""
     compose_content = f"""services:
@@ -33,7 +34,7 @@ def _generate_compose(root: Path, backend_port: int = 8000, frontend_port: int =
   frontend:
     build: ./frontend
     ports:
-      - "{frontend_port}:80"
+      - "{host_frontend_port}:{frontend_port}"
     depends_on:
       - backend
     restart: unless-stopped
@@ -43,6 +44,40 @@ def _generate_compose(root: Path, backend_port: int = 8000, frontend_port: int =
     return compose_path
 
 
+def _extract_host_port(compose_path: Path, fallback: int) -> int:
+    """Parse the frontend service's host-side port from a compose file.
+    Looks for a `ports:` mapping like "8500:80" and returns the host side.
+    Falls back to `fallback` if nothing parseable is found."""
+    try:
+        text = compose_path.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
+
+    # Grab the frontend service block, then find its first "host:container" port mapping.
+    frontend_block_match = re.search(
+        r"^\s*frontend:\s*\n(.*?)(?=^\s{0,2}\S+:\s*$|\Z)",
+        text, re.MULTILINE | re.DOTALL,
+    )
+    block = frontend_block_match.group(1) if frontend_block_match else text
+
+    port_match = re.search(r'["\']?(\d{2,5}):(\d{2,5})["\']?', block)
+    if port_match:
+        return int(port_match.group(1))
+    return fallback
+
+
+def _port_in_use(port: int) -> bool:
+    """Best-effort check whether a host port is already bound (Windows/Linux)."""
+    try:
+        check = subprocess.run(
+            ["docker", "ps", "--format", "{{.Ports}}"],
+            capture_output=True, text=True,
+        )
+        return f"0.0.0.0:{port}->" in check.stdout or f":{port}->" in check.stdout
+    except OSError:
+        return False
+
+
 def dockerize_and_run(output_repo_path: str, container_name: str, host_port: int = 8500) -> str:
     """
     Asks Claude Code to add Dockerfile/compose to the migrated app,
@@ -50,10 +85,20 @@ def dockerize_and_run(output_repo_path: str, container_name: str, host_port: int
     """
     root = Path(output_repo_path)
 
+    if _port_in_use(host_port):
+        raise RuntimeError(
+            f"Host port {host_port} is already bound by a running container. "
+            f"Stop it first (`docker ps` to find it) or pass a different host_port."
+        )
+
     prompt = (
         f"Add a production-ready Dockerfile (and docker-compose.yml if needed) "
         f"for the application at {output_repo_path}. The app should be runnable "
         f"with `docker build` and `docker run`, exposing its web port. "
+        f"IMPORTANT: the frontend/web service's host-side port mapping in any "
+        f"docker-compose.yml MUST be exactly {host_port} (e.g. \"{host_port}:80\" or "
+        f"\"{host_port}:<container_port>\") — do not use port 80, 3000, or any other "
+        f"default on the host side, only {host_port}. "
         "Do not change core application logic — only add Docker config."
     )
     flat_prompt = " ".join(prompt.split("\n"))
@@ -74,7 +119,8 @@ def dockerize_and_run(output_repo_path: str, container_name: str, host_port: int
         )
         if up.returncode != 0:
             raise RuntimeError(f"docker compose up failed: {up.stderr}")
-        return f"http://localhost:{host_port}"
+        actual_port = _extract_host_port(compose_file, fallback=host_port)
+        return f"http://localhost:{actual_port}"
 
     if layout["root_dockerfile"].exists():
         dockerfile = layout["root_dockerfile"]
@@ -105,7 +151,15 @@ def dockerize_and_run(output_repo_path: str, container_name: str, host_port: int
         if match:
             backend_port = int(match.group(1))
 
-        compose_path = _generate_compose(root, backend_port=backend_port)
+        frontend_port = 80
+        match = re.search(r"EXPOSE\s+(\d+)", layout["frontend_dockerfile"].read_text())
+        if match:
+            frontend_port = int(match.group(1))
+
+        compose_path = _generate_compose(
+            root, backend_port=backend_port,
+            frontend_port=frontend_port, host_frontend_port=host_port,
+        )
         up = subprocess.run(
             ["docker", "compose", "-f", str(compose_path), "-p", container_name, "up", "-d", "--build"],
             cwd=str(root), capture_output=True, text=True,

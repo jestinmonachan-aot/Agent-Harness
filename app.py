@@ -1,10 +1,11 @@
 """
 Streamlit UI for the agent harness workflow:
-  1. User pastes a GitHub repo link (the microservice to analyze)
+  1. User selects analysis skills, pastes a GitHub repo link
   2. We clone it
-  3. We call Claude Code CLI to analyze vulnerabilities
-  4. We parse + display the result, and save it as a .md report
-  5. Optionally migrate to a new stack -> push to new repo
+  3. We call Claude Code CLI to analyze it (focused on selected skills)
+  4. We parse structured findings + display them, and generate a PDF report
+  5. Migrate: Claude picks the best modern stack itself, migrates,
+     pushes to AOT-Technologies/harness-new (new branch per migration)
   6. Optionally dockerize + deploy -> show URL
 
 Each step runs in a fully detached worker process (see harness/worker.py +
@@ -21,12 +22,14 @@ import streamlit as st
 
 from harness import db, job_runner
 from harness.claude_cli import check_claude_available
+from harness.skills import SKILLS
+from harness.md_utils import generate_pdf_report
 
 st.set_page_config(page_title="Agent Harness — Vulnerability Scan", layout="wide")
 db.init_db()
 
 st.title("Legacy App Migration — Vulnerability Scan")
-st.caption("Paste a repo link for the target microservice to analyze it with Claude Code.")
+st.caption("Select skills, paste a repo link, and analyze it with Claude Code.")
 
 with st.sidebar:
     st.subheader("Environment check")
@@ -40,6 +43,17 @@ for key in ["job_id", "repo_url"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
+st.subheader("Select analysis skills")
+st.caption("Selected skills get deep focus. Unselected skills still get a lighter pass — nothing is fully ignored.")
+skill_ids = list(SKILLS.keys())
+skill_cols = st.columns(len(skill_ids))
+selected_skills = []
+for col, skill_id in zip(skill_cols, skill_ids):
+    with col:
+        default_checked = True
+        if st.checkbox(SKILLS[skill_id]["label"], value=default_checked, key=f"skill_{skill_id}"):
+            selected_skills.append(skill_id)
+
 repo_url = st.text_input(
     "GitHub repo URL",
     placeholder="https://github.com/org/glpi",
@@ -51,7 +65,7 @@ if run_clicked:
     job_id = job_runner.resume_or_new_job(repo_url)
     existing_status = job_runner.get_step_status(job_id, "analyze")
     if not existing_status or existing_status["status"] != "done":
-        job_runner.launch_step(job_id, "analyze", {"repo_url": repo_url})
+        job_runner.launch_step(job_id, "analyze", {"repo_url": repo_url, "skills": selected_skills})
     st.session_state.job_id = job_id
     st.session_state.repo_url = repo_url
 
@@ -72,40 +86,92 @@ if job_id is not None:
         st.error(f"Analysis failed:\n\n```\n{analyze_status['error'][-2000:]}\n```")
 
     elif analyze_status and analyze_status["status"] == "done":
-        findings = job["findings"]
-        repo_path = job["repo_path"]
-
+        result_data = analyze_status["result"]
+        findings = result_data["findings"]
+        repo_path = result_data["repo_path"]
+        pdf_path = result_data.get("pdf_path")
+        skills_used = result_data.get("skills_used", [])
+    
         st.subheader("Findings")
-        st.markdown(findings)
-
-        report_path = Path("reports") / "latest_analysis.md"
-        if report_path.exists():
-            st.download_button(
-                "Download report (.md)",
-                data=report_path.read_text(encoding="utf-8"),
-                file_name="vulnerability_report.md",
-                mime="text/markdown",
-            )
+    
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        severity_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢", "info": "⚪"}
+    
+        # --- Summary counts, for the non-technical reader ---
+        if findings:
+            counts = {}
+            for f in findings:
+                sev = f.get("severity", "info")
+                counts[sev] = counts.get(sev, 0) + 1
+            summary_parts = [
+                f"{severity_icon.get(s, '⚪')} {counts[s]} {s.title()}"
+                for s in ["critical", "high", "medium", "low", "info"] if s in counts
+            ]
+            st.markdown("**Summary:** " + "  ·  ".join(summary_parts))
+    
+        if not findings:
+            st.info("No issues found.")
+        else:
+            # --- Group findings by category/skill, so each selected skill gets its own section ---
+            from harness.skills import SKILLS
+            grouped = {}
+            for f in findings:
+                cat = f.get("category", "general")
+                grouped.setdefault(cat, []).append(f)
+    
+            # Show selected skills first (in the order the user picked them), then any leftover categories
+            ordered_categories = [s for s in skills_used if s in grouped] + \
+                                  [c for c in grouped if c not in skills_used]
+    
+            for cat in ordered_categories:
+                cat_label = SKILLS.get(cat, {}).get("label", cat.replace("_", " ").title())
+                cat_findings = sorted(grouped[cat], key=lambda x: severity_order.get(x.get("severity", "info"), 4))
+                st.markdown(f"### {cat_label} ({len(cat_findings)})")
+                for f in cat_findings:
+                    icon = severity_icon.get(f.get("severity", "info"), "⚪")
+                    title = f.get("title", "Untitled finding")
+                    sev = f.get("severity", "info").upper()
+                    with st.expander(f"{icon} [{sev}] {title}"):
+                        if f.get("location"):
+                            st.code(f.get("location"), language=None)
+                        st.write(f.get("description", ""))
+                        if f.get("recommendation"):
+                            st.info(f"**Recommendation:** {f.get('recommendation')}")
+    
+        pdf_path = Path("reports") / f"analysis_report_{job_id}.pdf"
+        
+        # Always regenerate fresh right before offering the download
+        generate_pdf_report(pdf_path, st.session_state.repo_url, findings, skills_used)
+        
+        st.download_button(
+            "Download report (PDF)",
+            data=pdf_path.read_bytes(),
+            file_name="analysis_report.pdf",
+            mime="application/pdf",
+            key="download_pdf_btn",
+        )
 
         st.divider()
-        st.subheader("Migrate to modern stack")
-        target_stack = st.text_input("Target stack", "Python FastAPI + React", key="target_stack")
-        scope_input = st.text_input("Which module/feature to migrate (e.g. 'ticketing')", "ticketing", key="scope_input")
-        output_repo_name = st.text_input("New output repo name", "migrated-app", key="output_repo_name")
+        st.subheader("Migrate to a modern stack")
+        st.caption("Claude analyzes the app and chooses the best-fit modern stack itself — you don't pick it.")
+        scope_input = st.text_input(
+            "Which module/feature to migrate (leave blank or type 'full app' for the entire application)",
+            "full app",
+            key="scope_input",
+        )
 
         migrate_status = job_runner.get_step_status(job_id, "migrate")
         migrate_running = bool(migrate_status and migrate_status["status"] == "running")
+        migrate_done = bool(migrate_status and migrate_status["status"] == "done")
 
-        if st.button("Run migration", key="run_migration_btn", disabled=migrate_running):
+        if st.button("Run migration", key="run_migration_btn", disabled=migrate_running or migrate_done):
             job_runner.launch_step(
                 job_id,
                 "migrate",
                 {
                     "repo_path": repo_path,
                     "findings": findings,
-                    "target_stack": target_stack,
                     "scope": scope_input,
-                    "output_repo_name": output_repo_name,
                 },
             )
             st.rerun()
@@ -120,21 +186,28 @@ if job_id is not None:
             elif migrate_status["status"] == "error":
                 st.error(f"Migration failed:\n\n```\n{migrate_status['error'][-2000:]}\n```")
             elif migrate_status["status"] == "done":
-                out_url = migrate_status["result"]["repo_url"]
+                m_result = migrate_status["result"]
+                out_url = m_result["repo_url"]
+                stack_chosen = m_result.get("stack_chosen", "unknown")
+                stack_reasoning = m_result.get("stack_reasoning", "")
                 st.success(f"Pushed to {out_url}")
+                st.write(f"**Stack chosen by Claude:** {stack_chosen}")
+                if stack_reasoning:
+                    with st.expander("Why this stack was chosen"):
+                        st.markdown(stack_reasoning)
 
         st.divider()
         st.subheader("Deploy with Docker")
 
-        # Deploy the migrated output if it exists, otherwise the original repo
         deploy_target = repo_path
         if migrate_status and migrate_status["status"] == "done":
             deploy_target = migrate_status["result"]["repo_path"]
 
         deploy_status = job_runner.get_step_status(job_id, "deploy")
         deploy_running = bool(deploy_status and deploy_status["status"] == "running")
+        deploy_done = bool(deploy_status and deploy_status["status"] == "done")
 
-        if st.button("Run deployment", key="run_deployment_btn", disabled=deploy_running):
+        if st.button("Run deployment", key="run_deployment_btn", disabled=deploy_running or deploy_done):
             job_runner.launch_step(
                 job_id,
                 "deploy",
