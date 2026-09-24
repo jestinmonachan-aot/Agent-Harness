@@ -61,9 +61,9 @@ from pathlib import Path
 from harness.claude_cli import run_claude_prompt
 
 DEFAULT_PLANNING_TIMEOUT = 600
-DEFAULT_PER_MODULE_TIMEOUT = 1800
-DEFAULT_ASSEMBLY_TIMEOUT = 1200
-DEFAULT_NARROW_SCOPE_TIMEOUT = 1800
+DEFAULT_PER_MODULE_TIMEOUT = 2700
+DEFAULT_ASSEMBLY_TIMEOUT = 1800
+DEFAULT_NARROW_SCOPE_TIMEOUT = 2700
 
 STATE_FILENAME = "MIGRATION_STATE.json"
 KNOWLEDGE_BASE_FILENAME = "KNOWLEDGE_BASE.md"
@@ -73,8 +73,9 @@ KNOWLEDGE_BASE_FILENAME = "KNOWLEDGE_BASE.md"
 # stdout+stderr. Kept broad-ish on purpose since exact wording of CLI
 # limit messages can change between versions.
 USAGE_LIMIT_SIGNATURES = [
-    "usage limit", "rate limit", "rate_limit", "quota", "too many requests",
-    "429", "resets at", "try again later", "overloaded",
+    "usage limit", "session limit", "rate limit", "rate_limit", "quota",
+    "too many requests", "429", "resets at", "resets ", "try again later",
+    "overloaded",
 ]
 
 
@@ -179,7 +180,21 @@ def _build_direct_prompt(input_repo_path: str, findings_md: str, scope: str) -> 
         "4. Fix the listed vulnerabilities as part of the rewrite.\n"
         "5. Do NOT modify anything at the legacy source path.\n"
         "6. Write MIGRATION_NOTES.md summarizing what was migrated.\n"
-        "7. As the LAST LINE of your final response, output exactly:\n"
+        "7. BEFORE writing your final summary, do a completeness self-audit: "
+        "go back through EXISTING_UX_INVENTORY.md line by line and confirm "
+        "each field/column/flow is actually implemented and reachable in the "
+        "UI you just built - not just modeled in the backend. If anything is "
+        "missing, go back and implement it now; do not report a gap as a "
+        "'follow-up' or 'known limitation' unless it is genuinely absent from "
+        "the legacy app too. Write PARITY_CHECK.md listing each inventory "
+        "item and a one-word DONE/MISSING status - if anything is MISSING, "
+        "fix it before finishing.\n"
+        "8. Before finishing, actually start the app (backend + frontend dev "
+        "servers) and smoke-test every implemented flow with a real request "
+        "(not just reading your own code) - creating an item, listing it, "
+        "editing it, and any flow-specific actions. Fix anything that "
+        "errors. Do not claim something works without having run it.\n"
+        "9. As the LAST LINE of your final response, output exactly:\n"
         "STACK_CHOSEN: <short stack name>\n"
     )
 
@@ -238,8 +253,12 @@ def _plan_modules(input_repo_path: str, timeout: int) -> list[dict]:
         extra_args=["--add-dir", str(input_repo_path)],
     )
     if not result.success:
-        # Planning failures aren't usage-limit-resumable in a meaningful way
-        # (nothing has been written yet) - just fail clearly.
+        if _looks_like_usage_limit(result.stdout, result.stderr):
+            raise RuntimeError(
+                f"Hit what looks like a Claude usage/rate limit during module "
+                f"planning (nothing written yet, nothing to resume - just retry "
+                f"once the limit resets): {result.stderr[:300] or result.stdout[:300]}"
+            )
         raise RuntimeError(f"Module planning failed. returncode={result.returncode}, stdout={result.stdout[:500]!r}")
 
     match = re.search(r"\[.*\]", result.stdout, re.DOTALL)
@@ -337,7 +356,23 @@ def _build_module_prompt(
         "for future calls, not documentation.\n"
         f"6. Append a section to MIGRATION_NOTES.md (create it if it doesn't "
         f"exist) summarizing what was migrated for the '{module_id}' module.\n"
-        "7. As the LAST LINE of your final response, output exactly:\n"
+        f"7. BEFORE writing your final summary, do a completeness self-audit: "
+        f"go back through EXISTING_UX_INVENTORY_{module_id}.md line by line "
+        "and confirm each field/column/flow is actually implemented and "
+        "reachable in the UI you just built - not just modeled in the "
+        "backend. If anything is missing, go back and implement it now; do "
+        "not report a gap as a 'follow-up' or 'known limitation' unless it "
+        f"is genuinely absent from the legacy app too. Write "
+        f"PARITY_CHECK_{module_id}.md listing each inventory item and a "
+        "one-word DONE/MISSING status - if anything is MISSING, fix it "
+        "before finishing.\n"
+        "8. Before finishing, actually start the app (backend + frontend dev "
+        "servers, alongside any modules already built) and smoke-test this "
+        "module's flows with a real request (not just reading your own "
+        "code) - creating an item, listing it, editing it, and any "
+        "flow-specific actions. Fix anything that errors. Do not claim "
+        "something works without having run it.\n"
+        "9. As the LAST LINE of your final response, output exactly:\n"
         "STACK_CHOSEN: <short stack name>\n"
     )
 
@@ -400,12 +435,22 @@ def _build_assembly_prompt(output_dir: Path, modules: list[dict], chosen_stack: 
         "rather than N disconnected mini-apps.\n"
         f"4. Cross-check the assembled app against every "
         f"EXISTING_UX_INVENTORY_*.md file in {output_dir} - confirm every "
-        "listed field/flow/label is actually present and named consistently "
-        "with the legacy app. Fix anything that drifted.\n"
+        "listed field/flow/label is actually present, reachable through the "
+        "UI, and functional after wiring - not just present in isolation. "
+        "Actually run the assembled app (backend + frontend) and click "
+        "through every module's main flows post-integration; integration "
+        "frequently breaks things that worked standalone (routing "
+        "collisions, shared auth, naming conflicts). Fix anything broken by "
+        "assembly before finishing.\n"
         "5. Write a top-level README.md describing the app, its modules, and "
         "how to run it.\n"
         "6. Do not remove or regress functionality already migrated per "
         "module - only integrate and fix conflicts.\n"
+        "7. Write a final PARITY_CHECK.md at the top level, merging every "
+        f"per-module PARITY_CHECK_*.md in {output_dir} into one list - every "
+        "item across every module, with DONE/MISSING status re-verified "
+        "after assembly (something that was DONE pre-assembly can break "
+        "during wiring). If anything is MISSING, fix it before finishing.\n"
     )
 
 
