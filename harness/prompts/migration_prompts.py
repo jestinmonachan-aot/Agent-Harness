@@ -2,10 +2,22 @@
 harness/migrate.py's orchestration logic so wording can be reviewed and
 edited on its own.
 
-FAST MODE: full-app migrations must fit a strict time budget, so
-fast_mode=True skips the completeness self-audit / runtime smoke-test
-steps that narrow-scope migrations still get. This is a deliberate
-speed-vs-thoroughness tradeoff, not an oversight.
+FAST MODE: full-app migrations previously fit a strict single-call time
+budget via fast_mode=True on build_direct_prompt, skipping completeness
+self-audit / smoke-test steps. That path is still available for narrow
+scope. Full-app migrations now go through the module pipeline instead
+(build_planning_prompt -> build_module_prompt x N -> build_assembly_prompt),
+trading the 1-hour ceiling for real breadth, with per-module audit/
+smoke-test steps built in throughout.
+
+CODEBASE MAP: analyze already explores the repo once and produces a
+structural map (see harness/prompts/analysis_prompts.py's
+CODEBASE_MAP block). Every prompt below accepts codebase_map and, when
+given, instructs Claude to treat it as authoritative for overall layout
+rather than re-exploring the directory structure from scratch - this
+applies to planning and to every individual module, not just the
+narrow-scope direct path, since re-exploring per module was pure waste
+once analyze had already done it once.
 """
 
 from __future__ import annotations
@@ -14,8 +26,25 @@ from pathlib import Path
 KNOWLEDGE_BASE_FILENAME = "KNOWLEDGE_BASE.md"
 
 
+def _codebase_map_block(codebase_map: str, scope_hint: str) -> str:
+    if not codebase_map:
+        return ""
+    return (
+        f"A prior analysis pass already explored this codebase and produced "
+        f"the structural map below. Treat it as authoritative for overall "
+        f"layout - do NOT re-explore the directory structure from scratch. "
+        f"Use it to jump straight to the specific files you need for "
+        f"{scope_hint}. Still actually open and read those specific files "
+        f"for exact field names/validation/etc - the map tells you WHERE to "
+        f"look, not what's inside each file.\n\n"
+        f"--- CODEBASE MAP (from prior analysis) ---\n{codebase_map}\n"
+        f"--- END CODEBASE MAP ---\n\n"
+    )
+
+
 def build_direct_prompt(
     input_repo_path: str, findings_md: str, scope: str, fast_mode: bool = False,
+    codebase_map: str = "",
 ) -> str:
     audit_steps = (
         "7. As the LAST LINE of your final response, output exactly:\n"
@@ -39,6 +68,8 @@ def build_direct_prompt(
         "STACK_CHOSEN: <short stack name>\n"
     )
 
+    codebase_map_block = _codebase_map_block(codebase_map, f"'{scope}'")
+
     return (
         f"You are migrating ONLY the '{scope}' feature/module of a legacy "
         f"application to a modern tech stack of YOUR CHOOSING. Analyze the "
@@ -46,6 +77,7 @@ def build_direct_prompt(
         f"Django+Vue, Spring Boot+Angular, etc.) based on what the app "
         f"actually needs. This is not optional - choose one and justify it.\n\n"
         f"Legacy source (read-only, do not modify): {input_repo_path}\n\n"
+        f"{codebase_map_block}"
         f"Known vulnerabilities/issues to fix during the rewrite:\n{findings_md}\n\n"
         "REQUIREMENTS:\n"
         f"1. FIRST, before writing any new code: search the legacy source for "
@@ -83,19 +115,26 @@ def build_direct_prompt(
     )
 
 
-def build_planning_prompt(input_repo_path: str) -> str:
+def build_planning_prompt(input_repo_path: str, codebase_map: str = "") -> str:
+    codebase_map_block = _codebase_map_block(
+        codebase_map, "identifying the app's functional modules"
+    )
     return (
         "You are planning a migration of the ENTIRE application to a modern "
         f"stack. Legacy source (read-only): {input_repo_path}\n\n"
-        "Explore the codebase structure (directory names, controller/route "
-        "files, DB schema) enough to identify the natural functional modules "
-        "of the app - the way a user or admin would describe its distinct "
-        "feature areas (e.g. 'tickets', 'assets', 'user management', "
-        "'authentication', 'reporting'). Keep the list to what's actually "
-        "distinct: typically 3-8 modules. Keep each module SMALL enough that "
-        "it could realistically be read and reimplemented within about 30 "
-        "minutes of focused work - split a large area into two modules "
-        "rather than proposing one oversized module.\n\n"
+        f"{codebase_map_block}"
+        "Identify the natural functional modules of the app - the way a user "
+        "or admin would describe its distinct feature areas (e.g. 'tickets', "
+        "'assets', 'user management', 'authentication', 'reporting'). If the "
+        "codebase map above is provided, use it to identify modules directly "
+        "rather than re-exploring the directory structure; otherwise, "
+        "explore the codebase structure (directory names, controller/route "
+        "files, DB schema) enough to identify them yourself. Keep the list "
+        "to what's actually distinct: typically 3-8 modules. Keep each "
+        "module SMALL enough that it could realistically be read and "
+        "reimplemented within about 30-45 minutes of focused work - split a "
+        "large area into two modules rather than proposing one oversized "
+        "module.\n\n"
         "Order the list so that foundational/shared modules (auth, core "
         "data model, users) come BEFORE modules that depend on them.\n\n"
         "Respond with ONLY a JSON array, nothing else, no markdown fences:\n"
@@ -111,10 +150,12 @@ def build_module_prompt(
     module: dict,
     findings_md: str,
     is_first_module: bool,
+    codebase_map: str = "",
 ) -> str:
     module_id = module["id"]
     module_desc = module.get("description", module_id)
     kb_path = output_dir / KNOWLEDGE_BASE_FILENAME
+    codebase_map_block = _codebase_map_block(codebase_map, f"the '{module_id}' module")
 
     if is_first_module:
         knowledge_base_instruction = (
@@ -142,18 +183,20 @@ def build_module_prompt(
         f"do not break them.\n\n"
         f"Legacy source (read-only, do not modify): {input_repo_path}\n"
         f"Output directory (write here, may already contain other modules): {output_dir}\n\n"
+        f"{codebase_map_block}"
         f"Known vulnerabilities/issues to fix if relevant to this module:\n{findings_md}\n\n"
         f"{knowledge_base_instruction}\n"
         "REQUIREMENTS:\n"
         f"1. Search the legacy source for every file relevant to the "
-        f"'{module_id}' module (front/, ajax/, src/, templates/, install/mysql "
-        f"schema, etc.) - controllers/routes, FORM templates, and LIST/TABLE "
-        "VIEW templates (and any partials they include). A module typically "
-        "has BOTH a form (create/edit single item) AND a list view (the table "
-        "shown when browsing many items) - find and read both; a common "
-        "failure is inventorying only the form and shipping a generic table "
-        f"for the list view. Write EXISTING_UX_INVENTORY_{module_id}.md with "
-        "TWO sections:\n"
+        f"'{module_id}' module (use the codebase map above if provided to "
+        f"jump straight to the right files; front/, ajax/, src/, templates/, "
+        f"install/mysql schema, etc. otherwise) - controllers/routes, FORM "
+        "templates, and LIST/TABLE VIEW templates (and any partials they "
+        "include). A module typically has BOTH a form (create/edit single "
+        "item) AND a list view (the table shown when browsing many items) - "
+        "find and read both; a common failure is inventorying only the form "
+        f"and shipping a generic table for the list view. Write "
+        f"EXISTING_UX_INVENTORY_{module_id}.md with TWO sections:\n"
         "   a) FORM: every field name, its type/options, validation rules, "
         "default values, and every user-facing flow/action.\n"
         "   b) LIST VIEW: the exact column set and column order shown in the "

@@ -3,21 +3,30 @@ targeted fixes to the app (one scoped module, or the entire
 application), then push to a NEW output repo (never touches the input
 repo).
 
-TIME CONSTRAINT: a full-app migration must complete within roughly one
-hour, so it routes through the SAME single-call path as a narrow-scope
-migration (see below), just with an effective scope of "the entire
-application" and with the completeness self-audit / runtime
-smoke-testing steps skipped (fast_mode) to keep the single call within
-budget. Full completeness across every module of a large legacy app is
-not realistic in one hour; this deliberately produces a smaller, best-
-effort slice rather than an incomplete or timed-out attempt at
-everything.
+Two paths:
 
-The previous plan -> build-per-module -> assemble pipeline (for
-higher-quality, more complete output at the cost of much longer wall-
-clock time) is kept in this file, unused, in case the time constraint
-is relaxed later - see `_run_full_app_module_pipeline` and the
-commented-out call site in `migrate_and_push`.
+- NARROW scope (e.g. "tickets"): a single direct Claude Code call
+  (_migrate_direct), audit/smoke-test steps included, bounded by
+  DEFAULT_NARROW_SCOPE_TIMEOUT. Fast, deployable on its own.
+
+- FULL APP: routes through the plan -> build-per-module -> assemble
+  pipeline (_run_full_app_module_pipeline) for real breadth across the
+  app's functional modules, rather than the single-call "pick one
+  central workflow" shortcut this file used previously. This trades a
+  strict 1-hour ceiling for a longer but much more complete run -
+  expect this to take considerably longer for a large app. Progress is
+  persisted to MIGRATION_STATE.json after every completed module, and
+  a usage/rate-limit failure raises UsageLimitError carrying the
+  output directory so a failed run can be resumed (pass the same
+  directory back in as resume_output_dir) rather than restarted.
+
+CODEBASE MAP: when analyze has already produced a codebase_map, it is
+passed through to EVERY Claude call in both paths - the direct call,
+planning, and every individual module - so none of them re-explore the
+repo's directory structure from scratch. This was previously only
+wired into the direct path; per-module calls were re-deriving the same
+structural context analyze had already produced, which is exactly the
+duplicated work this was meant to avoid.
 """
 
 from __future__ import annotations
@@ -39,7 +48,7 @@ from harness.prompts.migration_prompts import (
 DEFAULT_PLANNING_TIMEOUT = 600
 DEFAULT_PER_MODULE_TIMEOUT = 2700
 DEFAULT_ASSEMBLY_TIMEOUT = 1800
-DEFAULT_NARROW_SCOPE_TIMEOUT = 3000  # 50 min, leaving buffer under a 1hr full-app budget
+DEFAULT_NARROW_SCOPE_TIMEOUT = 3000  # 50 min
 
 STATE_FILENAME = "MIGRATION_STATE.json"
 KNOWLEDGE_BASE_FILENAME = "KNOWLEDGE_BASE.md"
@@ -99,11 +108,15 @@ def _save_state(output_dir: Path, state: dict) -> None:
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Narrow-scope path: single direct call
+# ---------------------------------------------------------------------------
+
 def _migrate_direct(
     input_repo_path: str, output_dir: Path, findings_md: str, scope: str,
-    timeout: int, fast_mode: bool = False,
+    timeout: int, fast_mode: bool = False, codebase_map: str = "",
 ) -> str:
-    prompt = build_direct_prompt(input_repo_path, findings_md, scope, fast_mode=fast_mode)
+    prompt = build_direct_prompt(input_repo_path, findings_md, scope, fast_mode=fast_mode, codebase_map=codebase_map)
     result = run_claude_prompt(
         prompt, cwd=str(output_dir), timeout=timeout,
         extra_args=["--add-dir", str(input_repo_path)],
@@ -121,12 +134,12 @@ def _migrate_direct(
 
 
 # ---------------------------------------------------------------------------
-# UNUSED (kept for future re-enable): plan -> build-per-module -> assemble
+# Full-app path: plan -> build-per-module -> assemble
 # ---------------------------------------------------------------------------
 
-def _plan_modules(input_repo_path: str, timeout: int) -> list[dict]:
+def _plan_modules(input_repo_path: str, timeout: int, codebase_map: str = "") -> list[dict]:
     print("[migrate] Planning module breakdown...", flush=True)
-    prompt = build_planning_prompt(input_repo_path)
+    prompt = build_planning_prompt(input_repo_path, codebase_map=codebase_map)
     result = run_claude_prompt(
         prompt, cwd=str(input_repo_path), timeout=timeout,
         extra_args=["--add-dir", str(input_repo_path)],
@@ -152,12 +165,21 @@ def _plan_modules(input_repo_path: str, timeout: int) -> list[dict]:
 
 
 def _migrate_module(
-    input_repo_path: str, output_dir: Path, module: dict, findings_md: str,
-    is_first_module: bool, timeout: int,
+    input_repo_path: str,
+    output_dir: Path,
+    module: dict,
+    findings_md: str,
+    is_first_module: bool,
+    timeout: int,
+    codebase_map: str = "",
 ) -> str:
     module_id = module["id"]
     print(f"[migrate] Building module: {module_id} ({module.get('description', module_id)})", flush=True)
-    prompt = build_module_prompt(input_repo_path, output_dir, module, findings_md, is_first_module)
+
+    prompt = build_module_prompt(
+        input_repo_path, output_dir, module, findings_md, is_first_module,
+        codebase_map=codebase_map,
+    )
     result = run_claude_prompt(
         prompt, cwd=str(output_dir), timeout=timeout,
         extra_args=["--add-dir", str(input_repo_path)],
@@ -166,13 +188,13 @@ def _migrate_module(
         if _looks_like_usage_limit(result.stdout, result.stderr):
             raise UsageLimitError(
                 f"Hit what looks like a usage/rate limit while migrating "
-                f"module '{module['id']}': {result.stderr[:300] or result.stdout[:300]}. "
+                f"module '{module_id}': {result.stderr[:300] or result.stdout[:300]}. "
                 f"Modules completed before this one are safely saved in "
                 f"{output_dir} - resume to continue from here.",
                 output_dir,
             )
         raise RuntimeError(
-            f"Migration of module '{module['id']}' failed. "
+            f"Migration of module '{module_id}' failed. "
             f"returncode={result.returncode}, stdout={result.stdout[:500]!r}"
         )
     stack_match = re.search(r"STACK_CHOSEN:\s*(.+)", result.stdout)
@@ -205,11 +227,11 @@ def _assemble_modules(output_dir: Path, modules: list[dict], chosen_stack: str, 
 def _run_full_app_module_pipeline(
     input_repo_path: str, findings_md: str, scope: str | None,
     planning_timeout: int, per_module_timeout: int, assembly_timeout: int,
-    resume_output_dir: str | None,
+    resume_output_dir: str | None, codebase_map: str = "",
 ) -> tuple[Path, str, list[dict]]:
-    """The higher-quality, longer-running full-app path. Not currently
-    called - see module docstring. Kept working and complete so it can
-    be re-enabled with a single call-site change in migrate_and_push."""
+    """The full-breadth full-app path: plan -> build each module -> assemble.
+    Now the active path for full-app scope (see migrate_and_push) rather
+    than a kept-but-unused alternative."""
     if resume_output_dir:
         output_dir = Path(resume_output_dir)
         state = _load_state(output_dir)
@@ -225,7 +247,7 @@ def _run_full_app_module_pipeline(
         assembly_done = state.get("assembly_done", False)
     else:
         output_dir = Path(tempfile.mkdtemp(prefix="migration_output_"))
-        modules = _plan_modules(input_repo_path, planning_timeout)
+        modules = _plan_modules(input_repo_path, planning_timeout, codebase_map=codebase_map)
         completed_ids = set()
         chosen_stack = "unknown"
         assembly_done = False
@@ -245,6 +267,7 @@ def _run_full_app_module_pipeline(
         chosen_stack = _migrate_module(
             input_repo_path, output_dir, module, findings_md,
             is_first_module=(i == 0), timeout=per_module_timeout,
+            codebase_map=codebase_map,
         )
         completed_ids.add(module["id"])
         _save_state(output_dir, {
@@ -277,35 +300,41 @@ def migrate_and_push(
     per_module_timeout: int = DEFAULT_PER_MODULE_TIMEOUT,
     assembly_timeout: int = DEFAULT_ASSEMBLY_TIMEOUT,
     resume_output_dir: str | None = None,
+    codebase_map: str = "",
 ) -> tuple[str, str, str, str]:
     """Returns (repo_url, local_output_path, stack_chosen, stack_reasoning).
 
-    Both narrow scope AND full-app scope use a single direct migration
-    call, to fit within a ~1 hour time budget. Full-app gets an
-    effective scope of "the entire application" and skips the
-    completeness self-audit / runtime smoke-test steps (fast_mode) to
-    stay within that budget - expect a smaller, best-effort slice
-    rather than full coverage of a large legacy app.
+    Narrow scope -> single direct call (_migrate_direct), fast, not
+    resumable (nothing partial to resume from one call).
+
+    Full app -> the module pipeline (_run_full_app_module_pipeline): plan,
+    build each module, assemble. RESUMABLE - if a module or assembly hits
+    a usage/rate limit, UsageLimitError carries output_dir; pass it back
+    as resume_output_dir to continue from the next incomplete step
+    without redoing finished modules or replanning.
+
+    `timeout`, if explicitly passed, overrides per_module_timeout, for
+    backward compatibility with older callers.
     """
     if timeout is not None:
         per_module_timeout = timeout
 
     full_app = _is_full_app(scope)
-    effective_scope = (
-        "the entire application - given the strict time budget, focus on "
-        "its single most central, highest-value workflow rather than "
-        "attempting full breadth"
-    ) if full_app else scope
 
-    output_dir = Path(tempfile.mkdtemp(prefix="migration_output_"))
-    chosen_stack = _migrate_direct(
-        input_repo_path, output_dir, findings_md, effective_scope,
-        DEFAULT_NARROW_SCOPE_TIMEOUT, fast_mode=full_app,
-    )
-    modules = [{
-        "id": "full_app" if full_app else scope.strip().lower().replace(" ", "_"),
-        "description": effective_scope,
-    }]
+    if full_app:
+        output_dir, chosen_stack, modules = _run_full_app_module_pipeline(
+            input_repo_path, findings_md, scope,
+            planning_timeout, per_module_timeout, assembly_timeout,
+            resume_output_dir, codebase_map=codebase_map,
+        )
+    else:
+        output_dir = Path(tempfile.mkdtemp(prefix="migration_output_"))
+        chosen_stack = _migrate_direct(
+            input_repo_path, output_dir, findings_md, scope,
+            DEFAULT_NARROW_SCOPE_TIMEOUT, fast_mode=False,
+            codebase_map=codebase_map,
+        )
+        modules = [{"id": scope.strip().lower().replace(" ", "_"), "description": scope}]
 
     decision_file = output_dir / "STACK_DECISION.md"
     stack_reasoning = decision_file.read_text(encoding="utf-8") if decision_file.exists() else ""

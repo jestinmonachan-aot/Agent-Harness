@@ -24,7 +24,94 @@ def extract_json_findings(cli_stdout: str) -> list[dict]:
             "description": match.group(1)[:1500],
             "location": "", "recommendation": "",
         }]
+    
+def extract_codebase_map(cli_stdout: str) -> str:
+    """Pull the codebase map markdown out between markers. Empty string
+    if not found, so callers can fall back to the old re-explore behavior."""
+    match = re.search(r"<<<CODEBASE_MAP_START>>>(.*?)<<<CODEBASE_MAP_END>>>", cli_stdout, re.DOTALL)
+    return match.group(1).strip() if match else ""
 
+
+
+def extract_module_names(codebase_map: str) -> list[str]:
+    """Pulls module/feature-area names out of ONLY the codebase_map's
+    'Main modules/feature areas' section (bounded by the next heading or
+    end of text) - not the whole document. Best-effort - falls back to
+    an empty list if no such section is found, and the caller should
+    always keep 'Full app' / manual entry as a fallback option."""
+
+    lines = codebase_map.splitlines()
+
+    # Find the start of the "main modules" section - a line that looks
+    # like a heading (markdown # or bold, or a short standalone label)
+    # and mentions "module" or "feature area".
+    start_idx = None
+    for i, line in enumerate(lines):
+        stripped = line.strip().strip("#*_ ").lower()
+        if "module" in stripped and len(stripped) < 60:
+            start_idx = i + 1
+            break
+        if "feature area" in stripped and len(stripped) < 60:
+            start_idx = i + 1
+            break
+
+    if start_idx is None:
+        return []
+
+    # Collect bullet lines until the next heading-like line (markdown
+    # heading, bold-only line, or a short line with no bullet marker
+    # that looks like a new section title) or end of text.
+    names = []
+    for line in lines[start_idx:]:
+        raw = line.rstrip()
+        stripped = raw.strip()
+
+        if not stripped:
+            continue  # blank lines don't end the section by themselves
+
+        is_bullet = stripped.startswith(("-", "*")) and not stripped.startswith(("**",))
+        looks_like_heading = (
+            stripped.startswith("#")
+            or (not is_bullet and len(stripped) < 60 and not stripped[0].isdigit()
+                and ":" not in stripped and "/" not in stripped and "`" not in stripped)
+        )
+
+        if not is_bullet and looks_like_heading:
+            break  # hit the next section
+
+        if not is_bullet:
+            continue  # stray prose line inside the section, skip it
+
+        text = stripped.lstrip("-* ").strip().strip("*_")
+        # Cut at the first delimiter that separates a name from its detail
+        for delim in [":", " - ", " (", "(", "`"]:
+            if delim in text:
+                text = text.split(delim, 1)[0].strip()
+                break
+        text = text.strip("*_ `")
+
+        # Reject anything that still looks like a file path or code token
+        if not text or "/" in text or "." in text or "`" in text:
+            continue
+        if not (2 <= len(text) <= 40):
+            continue
+        if text.lower() in ("module", "modules", "feature area", "feature areas"):
+            continue
+
+        names.append(text)
+
+    # De-dupe, preserve order
+    seen = set()
+    result = []
+    for n in names:
+        key = n.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(n)
+    return result[:15]
+
+
+    return result[:15]  # sane cap
 
 def generate_pdf_report(pdf_path, repo_url: str, findings: list[dict], skills_used: list[str]):
     from fpdf import FPDF

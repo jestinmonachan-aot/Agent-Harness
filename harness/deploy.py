@@ -166,6 +166,14 @@ def deploy_app(output_repo_path: str, container_name: str, host_port: int = 8500
         "root Dockerfile, docker-compose file, and backend/+frontend/ Dockerfiles)."
     )
 
+def stop_deployment(container_name: str) -> None:
+    """Stops and removes a running deployment so the port is free for a
+    new one. Safe to call even if nothing is running — docker errors on
+    a missing container are swallowed, not raised."""
+    subprocess.run(["docker", "compose", "-p", container_name, "down"],
+                    capture_output=True, text=True)
+    subprocess.run(["docker", "stop", container_name], capture_output=True, text=True)
+    subprocess.run(["docker", "rm", container_name], capture_output=True, text=True)
 
 # Backward-compatible alias — worker.py imports this name.
 dockerize_and_run = deploy_app

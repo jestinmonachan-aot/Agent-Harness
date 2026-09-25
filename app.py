@@ -134,6 +134,7 @@ if job_id is not None:
         findings = result_data["findings"]
         repo_path = result_data["repo_path"]
         skills_used = result_data.get("skills_used", [])
+        codebase_map = result_data.get("codebase_map", "")
 
         st.divider()
         st.subheader("Findings")
@@ -209,11 +210,37 @@ if job_id is not None:
         #     "attempting full breadth. For narrower results, name a specific "
         #     "module or feature below."
         # )
-        scope_input = st.text_input(
-            "Module/feature to migrate (leave blank or type 'full app' for the entire application)",
-            "full app",
-            key="scope_input",
+        migrate_status_check = job_runner.get_step_status(job_id, "migrate")
+        deploy_status_check = job_runner.get_step_status(job_id, "deploy")
+        if migrate_status_check or deploy_status_check:
+            if st.button("Start over (change scope)", key="start_over_btn"):
+                from harness import db
+                from harness.deploy import stop_deployment
+                if deploy_status_check and deploy_status_check["status"] == "done":
+                    stop_deployment("migrated_app")
+                db.clear_step(job_id, "deploy")
+                db.clear_step(job_id, "migrate")
+                st.session_state.pop("resume_migration_btn", None)
+                st.rerun()
+
+        from harness.md_utils import extract_module_names
+        suggested_modules = extract_module_names(codebase_map) if codebase_map else []
+        scope_options = ["Full app"] + suggested_modules + ["Other (type below)"]
+
+        scope_choice = st.selectbox(
+            "What to migrate",
+            scope_options,
+            key="scope_choice",
         )
+        if scope_choice == "Other (type below)":
+            scope_input = st.text_input(
+                "Module/feature name",
+                key="scope_input_custom",
+            )
+        elif scope_choice == "Full app":
+            scope_input = "full app"
+        else:
+            scope_input = scope_choice
 
         migrate_status = job_runner.get_step_status(job_id, "migrate")
         migrate_running = bool(migrate_status and migrate_status["status"] == "running")
@@ -242,6 +269,7 @@ if job_id is not None:
                     {
                         "repo_path": repo_path, "findings": findings,
                         "scope": scope_input, "resume_output_dir": resume_output_dir,
+                        "codebase_map": codebase_map,
                     },
                 )
                 st.rerun()
@@ -249,7 +277,7 @@ if job_id is not None:
             if st.button("Run migration", type="primary", key="run_migration_btn", disabled=migrate_running or migrate_done):
                 job_runner.launch_step(
                     job_id, "migrate",
-                    {"repo_path": repo_path, "findings": findings, "scope": scope_input},
+                    {"repo_path": repo_path, "findings": findings, "scope": scope_input, "codebase_map": codebase_map},
                 )
                 st.rerun()
 

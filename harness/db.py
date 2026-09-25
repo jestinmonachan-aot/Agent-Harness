@@ -145,3 +145,12 @@ def get_all_steps(job_id: int) -> list[sqlite3.Row]:
         return conn.execute(
             "SELECT * FROM steps WHERE job_id = ? ORDER BY started_at", (job_id,)
         ).fetchall()
+
+def clear_step(job_id: int, step_name: str) -> None:
+    """Removes a step's row entirely so it can be re-launched fresh
+    (e.g. switching migration scope from 'tickets' to 'auth')."""
+    with _conn() as conn:
+        conn.execute(
+            "DELETE FROM steps WHERE job_id = ? AND step_name = ?",
+            (job_id, step_name),
+        )    

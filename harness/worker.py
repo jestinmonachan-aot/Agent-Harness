@@ -46,7 +46,10 @@ def run_analyze(job_id: str, params: dict) -> str:
     if not result.success:
         raise RuntimeError(result.stderr or "Claude CLI analysis failed")
 
+    from harness.md_utils import extract_codebase_map  # add to existing import line instead if you prefer
+
     findings_list = extract_json_findings(result.stdout)
+    codebase_map = extract_codebase_map(result.stdout)
     db.save_findings(job_id, json.dumps(findings_list))
 
     pdf_path = Path("reports") / f"analysis_report_{job_id}.pdf"
@@ -57,6 +60,7 @@ def run_analyze(job_id: str, params: dict) -> str:
         "findings": findings_list,
         "skills_used": selected_skills,
         "pdf_path": str(pdf_path),
+        "codebase_map": codebase_map,
     })
 
 
@@ -64,11 +68,9 @@ def run_migrate(job_id: str, params: dict) -> str:
     repo_path = params["repo_path"]
     findings = params["findings"]
     scope = params.get("scope", "full app")
-    resume_output_dir = params.get("resume_output_dir")  # set by app.py's "Resume migration"
+    resume_output_dir = params.get("resume_output_dir")
+    codebase_map = params.get("codebase_map", "")
 
-    # findings may already be a list (from run_analyze's new structured
-    # output) or a JSON string (from db.get_job's stored TEXT column) —
-    # normalize to a markdown-ish string for the migration prompt.
     if isinstance(findings, str):
         try:
             findings = json.loads(findings)
@@ -87,11 +89,10 @@ def run_migrate(job_id: str, params: dict) -> str:
     if resume_output_dir:
         print(f"[migrate] Resuming migration from {resume_output_dir}", flush=True)
 
-    # UsageLimitError deliberately propagates up uncaught — main() below
-    # handles it specially so a usage limit is recorded as resumable
-    # rather than as a generic failure.
     out_url, out_path, stack_chosen, stack_reasoning = migrate_and_push(
-        repo_path, findings_md, scope, resume_output_dir=resume_output_dir,
+        repo_path, findings_md, scope,
+        resume_output_dir=resume_output_dir,
+        codebase_map=codebase_map,
     )
     db.save_migration(job_id, out_url)
 
