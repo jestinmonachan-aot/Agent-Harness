@@ -27,34 +27,107 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 2.5rem; max-width: 1100px; }
-    h1 { font-weight: 800 !important; }
+    .block-container { padding-top: 2rem; max-width: 1100px; }
+    h1 { font-weight: 800 !important; letter-spacing: -0.5px; }
     h2, h3, h4 { font-weight: 700 !important; }
     div[data-testid="stCheckbox"] label p { font-size: 1.02rem !important; }
+
     .stButton>button {
         border-radius: 8px;
         padding: 0.55rem 1.4rem;
         font-weight: 600;
+        transition: all 0.15s ease;
     }
     .stButton>button[kind="primary"] {
-        background-color: #FF4B4B;
+        background-color: #E02424 !important;
+        border: 1px solid #E02424 !important;
+        color: #ffffff !important;
     }
-    .skills-panel {
-        background-color: #1c2128;
-        border: 1px solid #30363d;
-        border-radius: 12px;
-        padding: 20px 20px 6px 20px;
-        margin-bottom: 1.2rem;
+    .stButton>button[kind="primary"]:hover {
+        background-color: #C81E1E !important;
+        border-color: #C81E1E !important;
     }
+    .stButton>button[kind="primary"]:disabled {
+        background-color: #7a2323 !important;
+        border-color: #7a2323 !important;
+        color: #d9a3a3 !important;
+        opacity: 1 !important;
+    }
+    .stButton>button:hover { transform: translateY(-1px); }
+
+    /* Start-over button: neutral grey, distinct from primary red */
+    .st-key-start_over_btn button {
+        background-color: #3a4048 !important;
+        border: 1px solid #58606a !important;
+        color: #e6edf3 !important;
+    }
+    .st-key-start_over_btn button:hover {
+        background-color: #474e58 !important;
+        border-color: #6a7280 !important;
+    }
+
+    /* Skills container: subtle grey tint so it reads as a grouped panel */
+    .st-key-skills_container {
+        background-color: #1c2128 !important;
+        border-color: #30363d !important;
+    }
+
+    /* Step badges */
+    .step-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 10px;
+        border-radius: 20px;
+        font-size: 0.78rem;
+        font-weight: 600;
+        margin-left: 8px;
+    }
+    .step-done { background: #1a3a2a; color: #4ade80; }
+    .step-running { background: #2a2a1a; color: #facc15; }
+    .step-error { background: #3a1a1a; color: #f87171; }
+    .step-pending { background: #24292f; color: #8b949e; }
+
+    /* Section cards */
+    .section-header {
+        margin-bottom: 0.4rem;
+    }
+    .section-header h3 { margin: 0 !important; }
+
+    hr { margin: 2rem 0 !important; opacity: 0.15; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+
+def step_badge(status: str | None) -> str:
+    """Return an HTML badge for a step's status (running/error only)."""
+    labels = {
+        "running": ("● Running", "step-running"),
+        "error": ("✕ Error", "step-error"),
+    }
+    if status not in labels:
+        return ""
+    text, cls = labels[status]
+    return f'<span class="step-badge {cls}">{text}</span>'
+
+
+def section_header(title: str, status: str | None):
+    badge = step_badge(status)
+    st.markdown(
+        f'<div class="section-header"><h3>{title}{" " + badge if badge else ""}</h3></div>',
+        unsafe_allow_html=True,
+    )
+
+
 db.init_db()
 
 st.title("Legacy App Modernization")
-# st.caption("Select focus areas, paste a repo link, and analyze it.")
+
+for key in ["job_id", "repo_url"]:
+    if key not in st.session_state:
+        st.session_state[key] = None
 
 with st.sidebar:
     st.subheader("Status")
@@ -64,19 +137,13 @@ with st.sidebar:
     else:
         st.error("Not available — check setup.")
 
-for key in ["job_id", "repo_url"]:
-    if key not in st.session_state:
-        st.session_state[key] = None
-
 st.subheader("Select analysis focus areas")
 st.caption("Select the skills that you want in this application.")
-
-st.markdown('<div class="skills-panel">', unsafe_allow_html=True)
 
 skill_ids = list(SKILLS.keys())
 selected_skills = []
 
-with st.container(border=True):
+with st.container(border=True, key="skills_container"):
     n_cols = min(3, len(skill_ids))
     skill_rows = [skill_ids[i:i + n_cols] for i in range(0, len(skill_ids), n_cols)]
     for row in skill_rows:
@@ -93,13 +160,16 @@ with st.container(border=True):
                         selected_skills.append(skill_id)
 
 st.subheader("Repository")
-repo_url = st.text_input(
-    "Repository URL",
-    placeholder="https://github.com/org/app",
-    label_visibility="collapsed",
-)
+repo_col, btn_col = st.columns([4, 1])
+with repo_col:
+    repo_url = st.text_input(
+        "Repository URL",
+        placeholder="https://github.com/org/app",
+        label_visibility="collapsed",
+    )
+with btn_col:
+    run_clicked = st.button("Run analysis", type="primary", disabled=not repo_url, use_container_width=True)
 
-run_clicked = st.button("Run analysis", type="primary", disabled=not repo_url)
 st.write("")
 
 if run_clicked:
@@ -109,6 +179,7 @@ if run_clicked:
         job_runner.launch_step(job_id, "analyze", {"repo_url": repo_url, "skills": selected_skills})
     st.session_state.job_id = job_id
     st.session_state.repo_url = repo_url
+    st.rerun()
 
 job_id = st.session_state.job_id
 
@@ -137,7 +208,7 @@ if job_id is not None:
         codebase_map = result_data.get("codebase_map", "")
 
         st.divider()
-        st.subheader("Findings")
+        section_header("Findings", "done")
 
         severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
         severity_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢", "info": "⚪"}
@@ -147,11 +218,10 @@ if job_id is not None:
             for f in findings:
                 sev = f.get("severity", "info")
                 counts[sev] = counts.get(sev, 0) + 1
-            summary_parts = [
-                f"{severity_icon.get(s, '⚪')} {counts[s]} {s.title()}"
-                for s in ["critical", "high", "medium", "low", "info"] if s in counts
-            ]
-            st.markdown("**Summary:** " + "  ·  ".join(summary_parts))
+            metric_cols = st.columns(5)
+            for col, sev in zip(metric_cols, ["critical", "high", "medium", "low", "info"]):
+                with col:
+                    st.metric(f"{severity_icon[sev]} {sev.title()}", counts.get(sev, 0))
             st.write("")
 
         if not findings:
@@ -172,7 +242,6 @@ if job_id is not None:
                 for f in cat_findings:
                     icon = severity_icon.get(f.get("severity", "info"), "⚪")
                     title = f.get("title", "Untitled finding")
-                    sev = f.get("severity", "info").upper()
                     summary = f.get("summary") or f.get("description", "")
                     with st.expander(f"{icon}  **{title}**  —  {summary}"):
                         if f.get("location") or f.get("description"):
@@ -203,25 +272,10 @@ if job_id is not None:
         )
 
         st.divider()
-        st.subheader("Migrate to a modern stack")
-        # st.caption(
-        #     "A full-app migration completes within about an hour by focusing "
-        #     "on the application's most central workflow, rather than "
-        #     "attempting full breadth. For narrower results, name a specific "
-        #     "module or feature below."
-        # )
         migrate_status_check = job_runner.get_step_status(job_id, "migrate")
         deploy_status_check = job_runner.get_step_status(job_id, "deploy")
-        if migrate_status_check or deploy_status_check:
-            if st.button("Start over (change scope)", key="start_over_btn"):
-                from harness import db
-                from harness.deploy import stop_deployment
-                if deploy_status_check and deploy_status_check["status"] == "done":
-                    stop_deployment("migrated_app")
-                db.clear_step(job_id, "deploy")
-                db.clear_step(job_id, "migrate")
-                st.session_state.pop("resume_migration_btn", None)
-                st.rerun()
+
+        section_header("Migrate to a modern stack", migrate_status_check["status"] if migrate_status_check else None)
 
         from harness.md_utils import extract_module_names
         suggested_modules = extract_module_names(codebase_map) if codebase_map else []
@@ -260,7 +314,7 @@ if job_id is not None:
 
         if resume_output_dir:
             st.warning(
-                "Migration paused — a usage limit was hit partway . "
+                "Migration paused — a usage limit was hit partway. "
                 "Progress so far is saved; you can pick up where it left off."
             )
             if st.button("Resume migration", key="resume_migration_btn"):
@@ -307,8 +361,20 @@ if job_id is not None:
                     with st.expander("Why this stack was chosen"):
                         st.markdown(stack_reasoning)
 
+        if migrate_status_check or deploy_status_check:
+            _spacer, _btn_col = st.columns([4, 1.3])
+            with _btn_col:
+                if st.button("Start over (change scope)", key="start_over_btn", use_container_width=True):
+                    from harness import db
+                    from harness.deploy import stop_deployment
+                    if deploy_status_check and deploy_status_check["status"] == "done":
+                        stop_deployment("migrated_app")
+                    db.clear_step(job_id, "deploy")
+                    db.clear_step(job_id, "migrate")
+                    st.session_state.pop("resume_migration_btn", None)
+                    st.rerun()
+
         st.divider()
-        st.subheader("Deploy")
 
         deploy_target = repo_path
         if migrate_status and migrate_status["status"] == "done":
@@ -317,6 +383,8 @@ if job_id is not None:
         deploy_status = job_runner.get_step_status(job_id, "deploy")
         deploy_running = bool(deploy_status and deploy_status["status"] == "running")
         deploy_done = bool(deploy_status and deploy_status["status"] == "done")
+
+        section_header("Deploy", deploy_status["status"] if deploy_status else None)
 
         if st.button("Run deployment", type="primary", key="run_deployment_btn", disabled=deploy_running or deploy_done):
             job_runner.launch_step(
@@ -340,4 +408,4 @@ if job_id is not None:
             elif deploy_status["status"] == "done":
                 app_url = deploy_status["result"]["app_url"]
                 st.success(f"App live at: {app_url}")
-                st.markdown(f"[Open App]({app_url})")
+            
