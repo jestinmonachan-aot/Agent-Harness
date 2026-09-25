@@ -1,5 +1,7 @@
-"""Deployment step: ask Claude Code to dockerize the migrated app,
-build + run it, and return the live URL."""
+"""Deployment step: package the migrated app into a container and run
+it, returning the live URL. User-facing language avoids naming the
+underlying tooling (container engine, orchestration) since that's an
+implementation detail that may change."""
 
 from __future__ import annotations
 
@@ -11,7 +13,6 @@ from harness.claude_cli import run_claude_prompt
 
 
 def _find_dockerfiles(root: Path) -> dict:
-    """Look for the layouts we know how to handle."""
     return {
         "root_dockerfile": root / "Dockerfile",
         "compose": root / "docker-compose.yml" if (root / "docker-compose.yml").exists()
@@ -23,8 +24,6 @@ def _find_dockerfiles(root: Path) -> dict:
 
 def _generate_compose(root: Path, backend_port: int = 8000, frontend_port: int = 80,
                        host_frontend_port: int = 8500) -> Path:
-    """Minimal compose file for a backend/ + frontend/ split, when Claude
-    created per-service Dockerfiles but no compose to wire them together."""
     compose_content = f"""services:
   backend:
     build: ./backend
@@ -45,15 +44,11 @@ def _generate_compose(root: Path, backend_port: int = 8000, frontend_port: int =
 
 
 def _extract_host_port(compose_path: Path, fallback: int) -> int:
-    """Parse the frontend service's host-side port from a compose file.
-    Looks for a `ports:` mapping like "8500:80" and returns the host side.
-    Falls back to `fallback` if nothing parseable is found."""
     try:
         text = compose_path.read_text(encoding="utf-8")
     except OSError:
         return fallback
 
-    # Grab the frontend service block, then find its first "host:container" port mapping.
     frontend_block_match = re.search(
         r"^\s*frontend:\s*\n(.*?)(?=^\s{0,2}\S+:\s*$|\Z)",
         text, re.MULTILINE | re.DOTALL,
@@ -67,7 +62,6 @@ def _extract_host_port(compose_path: Path, fallback: int) -> int:
 
 
 def _port_in_use(port: int) -> bool:
-    """Best-effort check whether a host port is already bound (Windows/Linux)."""
     try:
         check = subprocess.run(
             ["docker", "ps", "--format", "{{.Ports}}"],
@@ -78,17 +72,16 @@ def _port_in_use(port: int) -> bool:
         return False
 
 
-def dockerize_and_run(output_repo_path: str, container_name: str, host_port: int = 8500) -> str:
-    """
-    Asks Claude Code to add Dockerfile/compose to the migrated app,
-    then builds and runs it. Returns the app URL.
-    """
+def deploy_app(output_repo_path: str, container_name: str, host_port: int = 8500) -> str:
+    """Packages and runs the migrated app. Returns the live app URL.
+    (Formerly `dockerize_and_run` - renamed since the name is now
+    user-facing terminology via app.py; behavior is unchanged.)"""
     root = Path(output_repo_path)
 
     if _port_in_use(host_port):
         raise RuntimeError(
-            f"Host port {host_port} is already bound by a running container. "
-            f"Stop it first (`docker ps` to find it) or pass a different host_port."
+            f"Port {host_port} is already in use by a running deployment. "
+            f"Stop it first or choose a different port."
         )
 
     prompt = (
@@ -105,7 +98,7 @@ def dockerize_and_run(output_repo_path: str, container_name: str, host_port: int
     result = run_claude_prompt(flat_prompt, cwd=output_repo_path, timeout=900)
     if not result.success:
         raise RuntimeError(
-            f"Dockerize prompt failed. returncode={result.returncode}, "
+            f"Deployment packaging failed. returncode={result.returncode}, "
             f"stdout={result.stdout[:500]!r}, stderr={result.stderr[:500]!r}"
         )
 
@@ -118,7 +111,7 @@ def dockerize_and_run(output_repo_path: str, container_name: str, host_port: int
             cwd=str(root), capture_output=True, text=True,
         )
         if up.returncode != 0:
-            raise RuntimeError(f"docker compose up failed: {up.stderr}")
+            raise RuntimeError(f"Deployment failed to start: {up.stderr}")
         actual_port = _extract_host_port(compose_file, fallback=host_port)
         return f"http://localhost:{actual_port}"
 
@@ -129,7 +122,7 @@ def dockerize_and_run(output_repo_path: str, container_name: str, host_port: int
             cwd=str(root), capture_output=True, text=True,
         )
         if build.returncode != 0:
-            raise RuntimeError(f"docker build failed: {build.stderr}")
+            raise RuntimeError(f"Deployment build failed: {build.stderr}")
 
         exposed_port = 80
         match = re.search(r"EXPOSE\s+(\d+)", dockerfile.read_text())
@@ -142,7 +135,7 @@ def dockerize_and_run(output_repo_path: str, container_name: str, host_port: int
             capture_output=True, text=True,
         )
         if run.returncode != 0:
-            raise RuntimeError(f"docker run failed: {run.stderr}")
+            raise RuntimeError(f"Deployment failed to start: {run.stderr}")
         return f"http://localhost:{host_port}"
 
     if layout["backend_dockerfile"].exists() and layout["frontend_dockerfile"].exists():
@@ -165,11 +158,14 @@ def dockerize_and_run(output_repo_path: str, container_name: str, host_port: int
             cwd=str(root), capture_output=True, text=True,
         )
         if up.returncode != 0:
-            raise RuntimeError(f"docker compose up failed (generated compose): {up.stderr}")
+            raise RuntimeError(f"Deployment failed to start (generated config): {up.stderr}")
         return f"http://localhost:{host_port} (frontend), http://localhost:{backend_port} (backend api)"
 
     raise RuntimeError(
-        f"Claude Code did not create a usable Docker layout (checked root Dockerfile, "
-        f"docker-compose.yml, and backend/+frontend/ Dockerfiles). "
-        f"CLI stdout: {result.stdout[:500]}"
+        "The migrated app has no recognizable deployment layout (checked for a "
+        "root Dockerfile, docker-compose file, and backend/+frontend/ Dockerfiles)."
     )
+
+
+# Backward-compatible alias — worker.py imports this name.
+dockerize_and_run = deploy_app

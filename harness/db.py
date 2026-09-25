@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from contextlib import contextmanager
 
-DB_PATH = Path("harness_data.db")
+DB_PATH = Path("data/harness_data.db")
 
 
 @contextmanager

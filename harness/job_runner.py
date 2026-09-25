@@ -24,8 +24,8 @@ else:
 _PARAMS_DIR = Path(tempfile.gettempdir()) / "harness_step_params"
 _PARAMS_DIR.mkdir(exist_ok=True)
 
-_LOG_DIR = Path("worker_logs")
-_LOG_DIR.mkdir(exist_ok=True)
+_LOG_DIR = Path("data/worker_logs")
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # The project root — the parent of this harness/ package directory.
 # Passed as cwd so `python -m harness.worker` resolves regardless of

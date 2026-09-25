@@ -149,6 +149,21 @@ def main() -> None:
             error=f"{USAGE_LIMIT_MARKER}{e.output_dir}::{e}",
         )
         sys.exit(1)
+    except RuntimeError as e:
+        msg = str(e)
+        if "usage/rate limit" in msg.lower() or "session limit" in msg.lower():
+            # Same family of failure as UsageLimitError, but raised as a plain
+            # RuntimeError by call sites with nothing to resume (e.g. planning,
+            # which fails before any output exists). Mark it the same way so
+            # app.py shows a clean one-liner instead of a traceback, just
+            # without an output_dir (no "Resume migration" button).
+            db.finish_step(
+                job_id, step_name, "error",
+                error=f"{USAGE_LIMIT_MARKER}::{msg}",
+            )
+        else:
+            db.finish_step(job_id, step_name, "error", error=traceback.format_exc())
+        sys.exit(1)
     except Exception:
         db.finish_step(job_id, step_name, "error", error=traceback.format_exc())
         sys.exit(1)
